@@ -68,6 +68,19 @@ node_modules/
 # dataconnect generated files
 .dataconnect
 
+# Build outputs — never commit compiled artifacts
+dist/
+dist-electron/
+dist-renderer/
+*.js.map
+
+# macOS junk
+.DS_Store
+**/.DS_Store
+
+# pnpm
+pnpm-lock.yaml
+
 # AI IDE / Agent tooling directories (auto-generated, not for source control)
 .agents/
 .claude/
