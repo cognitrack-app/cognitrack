@@ -1,0 +1,19 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── User private data ────────────────────────────────────────────────────
+    // All subcollections under /users/{uid}/ are read/write only by that user.
+    match /users/{uid}/{document=**} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+    }
+
+    // ── Protocols ────────────────────────────────────────────────────────────
+    // Any authenticated user can read protocols.
+    // Writes are blocked from clients — use Admin SDK via seedProtocols function.
+    match /protocols/{protocolId} {
+      allow read:  if request.auth != null;
+      allow write: if false;
+    }
+  }
+}
