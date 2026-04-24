@@ -7,18 +7,19 @@ import path from 'path';
 const CACHE_FILE = 'device-id.txt';
 
 /**
- * Returns a stable, anonymised device identifier for this Windows machine.
+ * Returns a stable, anonymised device identifier for this machine.
  *
  * Strategy:
  *   1. Read from userData cache (fastest path — avoids shelling out on every launch)
- *   2. Shell out to `wmic csproduct get UUID` to retrieve the hardware GUID
- *   3. SHA-256 hash the GUID so the raw hardware ID never leaves the machine
+ *   2a. macOS: shell out to system_profiler to retrieve the Hardware UUID
+ *   2b. Windows: shell out to PowerShell WMI to retrieve the hardware GUID
+ *   3. SHA-256 hash the ID so the raw hardware identifier never leaves the machine
  *   4. Persist the hash to userData so step 2 only ever runs once
  *
- * The resulting ID is 32 hex chars — irreversible, no PII.
- * Matches the v6 PRD: "SHA-256(Windows GUID)".
+ * The resulting ID is 64 hex chars — irreversible, no PII.
+ * Matches the v6 PRD: "SHA-256(macOS Hardware UUID)" / "SHA-256(Windows GUID)".
  */
-export function getWindowsDeviceId(): string {
+export function getDeviceId(): string {
   const cachePath = path.join(app.getPath('userData'), CACHE_FILE);
 
   // Fast path: already computed on a previous launch

@@ -35,6 +35,13 @@ export const mergeAgentData = onDocumentWritten(
     const data = after.data() as SessionDocument;
     if (!data) return;
 
+    // Preserve carryover values written by dailyReset.ts this morning.
+    // These fields are NOT part of any agent payload — they exist only in
+    // the Firestore document and must be passed through to derivations.
+    const existingData = (event.data?.before?.data() as Partial<SessionDocument>) ?? {};
+    data.carryover_debt_pts  = data.carryover_debt_pts ?? existingData.carryover_debt_pts ?? 0;
+    data.carryover_residue   = data.carryover_residue ?? existingData.carryover_residue ?? 0;
+
     const phone = data.phoneMetrics as PhoneSyncPayload | undefined;
     const desktopSessions = data.desktopSessions as
       | Record<string, DesktopSyncPayload>

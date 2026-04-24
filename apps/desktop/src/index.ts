@@ -6,7 +6,7 @@ import { registerIpcHandlers } from './electron/main/ipcHandlers';
 import { SQLiteStore } from './electron/main/sqliteStore';
 import { ActiveWindowTracker } from './electron/main/activeWindowTracker';
 import { waitForAuth, getTodayDateString } from './electron/main/utils';
-import { getWindowsDeviceId } from './electron/main/deviceId';
+import { getDeviceId } from './electron/main/deviceId';
 import { processBatch } from './electron/main/batchProcessor';
 import { SyncEngine } from '@cognitrack/sync-engine';
 import { registerDevice } from '@cognitrack/api-client';
@@ -70,7 +70,7 @@ app.whenReady().then(async () => {
   }
 
   // 9. Register/update this device in Firestore
-  deviceId = getWindowsDeviceId();
+  deviceId = getDeviceId();
   await registerDevice(userId, deviceId, process.platform as any, 'CogniTrack Desktop', app.getVersion())
     .catch(err => console.warn('[startup] Device registration failed (non-fatal):', err));
 

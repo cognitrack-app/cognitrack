@@ -115,7 +115,7 @@ export class ActiveWindowTracker {
     const rawName = result.owner?.name ?? '';
     if (!rawName) return;
 
-    const appId = normalizeAppId(rawName, 'win32');
+    const appId = normalizeAppId(rawName, process.platform === 'win32' ? 'win32' : 'darwin');
     const category = resolveCategory(appId);
     const now = Date.now();
 

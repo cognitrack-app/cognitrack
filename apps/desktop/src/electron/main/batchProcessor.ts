@@ -1,5 +1,64 @@
 import { calculateCognitiveDebt, resolveCategory } from '@cognitrack/shared';
-import type { AppEvent, DesktopSyncPayload, DesktopCategoryBreakdown } from '@cognitrack/shared';
+import type { AppEvent, BreakEvent, DesktopSyncPayload, DesktopCategoryBreakdown } from '@cognitrack/shared';
+
+const BREAK_MIN_DURATION_MS = 5 * 60 * 1000;   // 5 min minimum idle gap
+const BREAK_EFFICIENCY_THRESHOLD = 60;           // debt must drop >= this % to be 'STRUCTURED'
+
+/**
+ * Scans sorted app events for idle gaps >= 5 minutes and constructs
+ * BreakEvent records with debt_before / debt_after / efficiency_pct.
+ *
+ * Debt snapshots use the hourlyDebt array already produced by the
+ * cognitive engine, so there is no re-derivation cost.
+ */
+function detectBreakEvents(
+  events: AppEvent[],
+  hourlyDebt: number[],
+): BreakEvent[] {
+  if (events.length === 0) return [];
+
+  const breaks: BreakEvent[] = [];
+  const sorted = [...events].sort((a, b) => a.timestamp - b.timestamp);
+
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const current = sorted[i]!;
+    const next    = sorted[i + 1]!;
+    const gap     = next.timestamp - current.timestamp;
+
+    if (gap < BREAK_MIN_DURATION_MS) continue;
+
+    const startDate      = new Date(current.timestamp);
+    const endDate        = new Date(next.timestamp);
+    const durationMinutes = Math.round(gap / 60_000);
+
+    const hourBefore  = Math.max(0, startDate.getHours() - 1);
+    const hourAfter   = Math.min(23, endDate.getHours());
+    const debtBefore  = hourlyDebt[hourBefore] ?? 0;
+    const debtAfter   = hourlyDebt[hourAfter]  ?? 0;
+    const ptsRecovered = Math.max(0, debtBefore - debtAfter);
+    const efficiencyPct = debtBefore === 0
+      ? 0
+      : Math.round((ptsRecovered / debtBefore) * 100);
+
+    const activityType: BreakEvent['activity_type'] =
+      durationMinutes >= 120                         ? 'SLEEP'
+      : efficiencyPct >= BREAK_EFFICIENCY_THRESHOLD  ? 'STRUCTURED'
+      : 'UNSTRUCTURED';
+
+    breaks.push({
+      start_time:       startDate.toISOString(),
+      end_time:         endDate.toISOString(),
+      activity_type:    activityType,
+      duration_minutes: durationMinutes,
+      debt_before:      debtBefore,
+      debt_after:       debtAfter,
+      pts_recovered:    ptsRecovered,
+      efficiency_pct:   efficiencyPct,
+    });
+  }
+
+  return breaks;
+}
 import type { BrowserWindow } from 'electron';
 import type { SQLiteStore } from './sqliteStore';
 import type { SyncEngine } from '@cognitrack/sync-engine';
@@ -97,7 +156,10 @@ export async function processBatch(
     });
   }
 
-  // ── Build Firestore payload (11 scalars, zero raw data) ───────────────
+  // ── Detect break events from idle gaps in today's event stream ────────
+  const break_events = detectBreakEvents(rawEvents, report.hourlyDebt);
+
+  // ── Build Firestore payload ────────────────────────────────────────────
   const payload: DesktopSyncPayload = {
     deviceId,
     agentType:           'desktop',
@@ -112,6 +174,7 @@ export async function processBatch(
     categoryBreakdown,
     peakLoadHour:        report.peakLoadHour,
     hourlyLoad:          report.hourlyDebt,
+    break_events,
     lastUpdated:         new Date().toISOString(),
   };
 

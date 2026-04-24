@@ -117,6 +117,13 @@ export const weeklyRollup = onSchedule(
           : 0;
       });
       const recoveryMinutes = validSessions.map(s => {
+        // Use verified break minutes (same logic as derivations.ts)
+        const phoneB = s.phoneMetrics?.break_events ?? [];
+        const desktopB = Object.values(s.desktopSessions ?? {}).flatMap(d => d.break_events ?? []);
+        const verified = [...phoneB, ...desktopB]
+          .filter(b => b.efficiency_pct >= 40)
+          .reduce((sum, b) => sum + b.duration_minutes, 0);
+        if (verified > 0) return verified;
         const st = s.phoneMetrics?.totalScreenTime ?? 0;
         return Math.max(0, 16 - st) * 60;
       });
@@ -157,6 +164,63 @@ export const weeklyRollup = onSchedule(
         `avgFrag=${report.avg_fragmentation}, ` +
         `peakDay=${report.peak_debt_day}`
       );
+
+      // ──────────────────────────────────────────────────────────────────────────────
+      // Auto-trigger calibration if 7+ sessions exist and calibration
+      // has never run (last_calibrated_at equals created_at) OR it has
+      // been > 6 days since the last calibration run.
+      // This replaces the manual-only flow and ensures every user
+      // gets personalized thresholds after their first week.
+      // ──────────────────────────────────────────────────────────────────────────────
+      const SIX_DAYS_MS = 6 * 24 * 60 * 60 * 1000;
+      const lastCal = new Date(config.last_calibrated_at).getTime();
+      const createdAt = new Date(config.created_at).getTime();
+      const needsCalibration =
+        (config.last_calibrated_at === config.created_at ||
+          Date.now() - lastCal >= SIX_DAYS_MS) &&
+        validSessions.length >= 7;
+
+      if (needsCalibration) {
+        // Compute calibrated thresholds inline (mirrors calibrateBaselines.ts logic)
+        // so weeklyRollup is self-contained for new users.
+        const dailyAvgSwitches = validSessions.map(s => {
+          const total =
+            (s.phoneMetrics?.totalSwitches ?? 0) +
+            Object.values(s.desktopSessions ?? {}).reduce((sum, d) => sum + d.totalSwitches, 0);
+          const combinedHourly: number[] =
+            s.combinedHourlyLoad ?? s.phoneMetrics?.hourlyLoad ?? Array(24).fill(0);
+          const activeHours = combinedHourly.filter(l => l > 10).length || 8;
+          return total / activeHours;
+        });
+
+        const sortedSwitches = [...dailyAvgSwitches].sort((a, b) => a - b);
+        const trim = Math.floor(sortedSwitches.length * 0.15);
+        const trimmed = sortedSwitches.slice(trim, sortedSwitches.length - trim);
+        const newBaseline = Math.round(
+          trimmed.reduce((a, b) => a + b, 0) / (trimmed.length || 1)
+        );
+
+        const debtScores = validSessions
+          .map(s => s.combinedLoad ?? s.phoneMetrics?.cognitiveLoadPct ?? 0)
+          .sort((a, b) => a - b);
+        const p75idx = Math.floor(debtScores.length * 0.75);
+        const newDebtCritical = Math.round(debtScores[p75idx] ?? 70);
+
+        const configRef = db.collection('users').doc(uid)
+          .collection('config').doc('preferences');
+        await configRef.update({
+          switch_baseline: Math.max(20, newBaseline),
+          switch_critical_threshold: Math.min(120, Math.max(40, newBaseline * 2)),
+          cognitive_debt_critical_threshold: Math.max(50, Math.min(90, newDebtCritical)),
+          last_calibrated_at: new Date().toISOString(),
+        });
+        console.log(
+          `✅ Auto-calibrated uid=${uid}: ` +
+          `switchBaseline=${Math.max(20, newBaseline)}, ` +
+          `critThreshold=${Math.min(120, Math.max(40, newBaseline * 2))}, ` +
+          `debtCritical=${Math.max(50, Math.min(90, newDebtCritical))}`
+        );
+      }
     }
   }
 );
