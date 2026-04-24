@@ -13,7 +13,7 @@ This is a monorepo for CogniTrack, a neuroscience-grounded personal informatics 
 - `docs/` - Documentation
 
 ### Stack
-TypeScript, React, Expo, Node.js, PostgreSQL, Firebase, Docker
+TypeScript, React Native (Expo), Electron, Node.js, Firebase (Firestore + Cloud Functions), SQLite
 
 ## Key Components
 
@@ -28,9 +28,10 @@ The core cognitive engine is in the shared package, which provides:
 - Constants and types
 
 ### Applications
-- `apps/web` - React/TypeScript frontend
-- `apps/mobile` - Expo React Native app
-- `apps/desktop` - Cross-platform desktop application (macOS, Windows)
+- `apps/mobile` - Expo React Native app (iOS + Android phone agent)
+- `apps/desktop` - Cross-platform Electron desktop agent (macOS + Windows, single codebase)
+
+> ⚠️ **Desktop agent note:** There is no `apps/desktop-mac/` or `apps/desktop-windows/` — those folders exist as empty placeholders from the v6 architecture spec but have NOT been filled. All desktop code lives in `apps/desktop/`. A standalone `cognitrack-desktop` repo previously existed and is now archived — it is stale and should never be referenced.
 
 ### Backend
 - `functions/` - Firebase Cloud Functions for:
@@ -41,16 +42,16 @@ The core cognitive engine is in the shared package, which provides:
 
 ## Development Commands
 
-- `npm run dev:mobile` - Start mobile app
-- `npm run dev:desktop` - Start desktop app  
-- `npm run dev:functions` - Watch and build functions
-- `npm run build:shared` - Build shared package
-- `npm run build:functions` - Build functions
-- `npm run build:all` - Build everything
-- `npm run emulators` - Start Firebase emulators
-- `npm run deploy:functions` - Deploy functions
-- `npm run deploy:firestore` - Deploy Firestore rules
-- `npm run deploy:all` - Deploy everything
+- `pnpm dev:mobile` - Start mobile app
+- `pnpm dev:desktop` - Start desktop app (Electron + Vite dev server)
+- `pnpm dev:functions` - Watch and build Cloud Functions
+- `pnpm build:shared` - Build shared package (always run this first)
+- `pnpm build:functions` - Build functions
+- `pnpm build:all` - Build everything
+- `pnpm emulators` - Start Firebase emulators
+- `pnpm deploy:functions` - Deploy functions
+- `pnpm deploy:firestore` - Deploy Firestore rules
+- `pnpm deploy:all` - Deploy everything
 
 ## Architecture Overview
 
