@@ -88,3 +88,4 @@ pnpm-lock.yaml
 .cursor/
 .windsurf/
 apps/desktop/.env
+apps/
