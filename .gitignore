@@ -79,7 +79,6 @@ dist-renderer/
 **/.DS_Store
 
 # pnpm
-pnpm-lock.yaml
 
 # AI IDE / Agent tooling directories (auto-generated, not for source control)
 .agents/
