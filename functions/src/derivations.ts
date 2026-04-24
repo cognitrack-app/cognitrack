@@ -100,6 +100,17 @@ export function computeDerivedDayMetrics(
     desktops.reduce((s, d) => s + d.cognitiveDebt, 0) * 0.45
   );
 
+  // ── Carryover from overnight (written by dailyReset Cloud Function) ──────
+  // If the user didn't fully recover yesterday, carry that deficit into
+  // today's opening debt so projections accumulate correctly.
+  const carryoverDebt    = today.carryover_debt_pts    ?? 0;
+  const carryoverResidue = today.carryover_residue      ?? 0;   // 0–100
+
+  // Add carryover to the debt point total (not the %-score — that would
+  // double-count, since the session's cognitiveLoadPct already reflects
+  // today's events only)
+  const debtPointsWithCarryover = debtPoints + carryoverDebt;
+
   const debtSeverity =
     debtScore >= 80 ? 'CRITICAL'
     : debtScore >= 65 ? 'HIGH'
@@ -154,10 +165,14 @@ export function computeDerivedDayMetrics(
   const combinedResidue = Math.max(phoneResidue, desktopResidue);
   const residuePct = Math.round(combinedResidue * 100);
 
+  // Adjust residue: carryoverResidue is the overnight remnant in %.
+  // Blend it into combinedResidue so the residueLevel enum reflects it.
+  const blendedResiduePct = Math.min(100, residuePct + carryoverResidue);
+
   const residueLevel =
-    residuePct >= 70 ? 'SEVERE'
-    : residuePct >= 45 ? 'HIGH'
-    : residuePct >= 20 ? 'MODERATE'
+    blendedResiduePct >= 70 ? 'SEVERE'
+    : blendedResiduePct >= 45 ? 'HIGH'
+    : blendedResiduePct >= 20 ? 'MODERATE'
     : 'LOW';
 
   const residueTrend7d = last7.map(s => {
@@ -203,21 +218,34 @@ export function computeDerivedDayMetrics(
     const pf = pp ? Math.round(pp.totalScreenTime * 60 * (pp.categoryBreakdown.productive ?? 0)) : 0;
     return pf + Math.round(dd * 60);
   });
-  const avgLastMonthFocus = avgArr(last7FocusMin);
-  const focusMoM = avgLastMonthFocus === 0 ? 0
-    : Math.round(((totalFocusMin - avgLastMonthFocus) / avgLastMonthFocus) * 100);
+  // Renamed: compares vs last 7-day average, not a calendar month
+  const avgLast7DaysFocus = avgArr(last7FocusMin);
+  const focusWoW = avgLast7DaysFocus === 0 ? 0
+    : Math.round(((totalFocusMin - avgLast7DaysFocus) / avgLast7DaysFocus) * 100);
 
   // ── Stress Peak ────────────────────────────────────────────────────────────
   const last7PeakHours = last7.map(s => s.phoneMetrics?.peakLoadHour ?? 12);
   const avgPeakHour = Math.round(avgArr(last7PeakHours));
   const peakVsAvg =
-    peakHour > avgPeakHour + 1 ? 'LATER THAN AVG'
-    : peakHour < avgPeakHour - 1 ? 'EARLIER THAN AVG'
-    : 'ON AVERAGE';
+    peakHour > avgPeakHour + 1 ? 'Later than avg'
+    : peakHour < avgPeakHour - 1 ? 'Earlier than avg'
+    : 'On average';
 
   // ── Recovery ───────────────────────────────────────────────────────────────
+  // Compute from verified break events only (efficiency >= 40%).
+  // Idle time and unstructured non-breaks are excluded.
+  const phoneBreaksForRecovery: BreakEvent[] = p?.break_events ?? [];
+  const desktopBreaksForRecovery: BreakEvent[] = desktops.flatMap(d => d.break_events ?? []);
+  const allBreaksForRecovery = [...phoneBreaksForRecovery, ...desktopBreaksForRecovery];
+  const verifiedBreakMinutes = allBreaksForRecovery
+    .filter(b => b.efficiency_pct >= 40)
+    .reduce((sum, b) => sum + b.duration_minutes, 0);
+  // If no break events exist yet (phone-only early day), fall back to
+  // time-off-screen as a rough proxy so the field is never zero.
   const recoveryHours = Math.max(0, AWAKE_HOURS - screenTimeHours);
-  const recoveryMinutes = Math.round(recoveryHours * 60);
+  const recoveryMinutes = verifiedBreakMinutes > 0
+    ? verifiedBreakMinutes
+    : Math.round(recoveryHours * 60);
 
   // Recovery coefficient by period: 1 - avg_load = recovery quality
   const coeff = {
@@ -227,16 +255,22 @@ export function computeDerivedDayMetrics(
     evening:   Math.round((1 - avgArr(combinedHourlyLoad.slice(18, 22)) / 100) * 100),
   };
 
-  // Recovery MoM label
+  // Recovery WoW label — compares against last 7 sessions' verified break minutes
   const last7RecoveryMin = last7.map(s => {
+    const phoneB = s.phoneMetrics?.break_events ?? [];
+    const desktopB = Object.values(s.desktopSessions ?? {}).flatMap(d => d.break_events ?? []);
+    const verified = [...phoneB, ...desktopB]
+      .filter(b => b.efficiency_pct >= 40)
+      .reduce((sum, b) => sum + b.duration_minutes, 0);
+    if (verified > 0) return verified;
     const st = s.phoneMetrics?.totalScreenTime ?? 0;
     return Math.max(0, AWAKE_HOURS - st) * 60;
   });
-  const avgLastMonthRecovery = avgArr(last7RecoveryMin);
-  const recoveryMoM = avgLastMonthRecovery === 0 ? 'STABLE VS LAST MO.'
-    : recoveryMinutes > avgLastMonthRecovery * 1.1 ? 'IMPROVED VS LAST MO.'
-    : recoveryMinutes < avgLastMonthRecovery * 0.9 ? 'DECLINED VS LAST MO.'
-    : 'STABLE VS LAST MO.';
+  const avgLastWeekRecovery = avgArr(last7RecoveryMin);
+  const recoveryMoM = avgLastWeekRecovery === 0 ? 'Stable vs last wk.'
+    : recoveryMinutes > avgLastWeekRecovery * 1.1 ? 'Improved vs last wk.'
+    : recoveryMinutes < avgLastWeekRecovery * 0.9 ? 'Declined vs last wk.'
+    : 'Stable vs last wk.';
 
   // ── Break Events (merged from both devices) ────────────────────────────────
   const phoneBreaks: BreakEvent[] = p?.break_events ?? [];
@@ -290,7 +324,7 @@ export function computeDerivedDayMetrics(
     }
   }
 
-  const netPtsDelta = debtPoints - (last7[0] != null
+  const netPtsDelta = debtPointsWithCarryover - (last7[0] != null
     ? Math.round((last7[0].phoneMetrics?.cognitiveDebt ?? 0) +
         Object.values(last7[0].desktopSessions ?? {}).reduce((s, d) => s + d.cognitiveDebt, 0) * 0.45)
     : 0);
@@ -316,14 +350,18 @@ export function computeDerivedDayMetrics(
   const radarSleep = clamp(recoveryHours / sleepTarget, 0, 1);
   const radarFocus = clamp(totalFocusMin / 240, 0, 1);      // 4h = perfect
   const radarWmStrain = 1 - (wmStrain / 100);               // inverted
-  const radarRecovery = clamp(recoveryHours / 8, 0, 1);
+  // Use verified break minutes as the numerator (240 min = 4h = perfect recovery score).
+  // Falls back to time-off-screen if no break events exist yet.
+  const radarRecovery = verifiedBreakMinutes > 0
+    ? clamp(verifiedBreakMinutes / 240, 0, 1)
+    : clamp(recoveryHours / 8, 0, 1);
   // Circadian: how close peak load is to 14:00 (optimal window)
   const radarCircadian = 1 - Math.abs(peakHour - 14) / 12;
 
   // ── Readiness (Tomorrow) ───────────────────────────────────────────────────
-  const unclearedDebt = Math.max(0, debtPoints - Math.round(recoveryHours * 4));
+  const unclearedDebt = Math.max(0, debtPointsWithCarryover - Math.round(recoveryHours * 4));
   const projectedBaseline = clamp(
-    Math.round(unclearedDebt / 2 + residuePct * 0.3),
+    Math.round(unclearedDebt / 2 + blendedResiduePct * 0.3),
     0, 100
   );
   const circadianAlignment =
@@ -339,6 +377,38 @@ export function computeDerivedDayMetrics(
       : projectedBaseline > 30
       ? `Moderate load projected. Sleep before ${bedtimeHour + 1}:00 to maintain cognitive baseline.`
       : 'On track. Maintain current recovery pattern for optimal cognitive performance.';
+
+  // ── Daily Load Index (24h, for Day toggle view) ──────────────────────────
+  // combinedHourlyLoad is already the per-hour 0–100 load for today.
+  const cognitive_load_index_daily: number[] = combinedHourlyLoad;
+
+  // ── Monthly Load Index (last 30 days, for Month toggle view) ──────────────
+  // Built from up to last7 sessions; beyond 7 the weeklyRollup enriches this.
+  // For now: last7 padded with zeros to 30 entries; weeklyRollup backfills rest.
+  const last7DailyLoads = last7
+    .map(s => s.combinedLoad ?? s.phoneMetrics?.cognitiveLoadPct ?? 0)
+    .reverse();
+  const cognitive_load_index_monthly: number[] = [
+    ...Array(Math.max(0, 30 - last7DailyLoads.length - 1)).fill(0),
+    ...last7DailyLoads,
+    debtScore,
+  ].slice(-30);
+
+  // ── Data Completeness ──────────────────────────────────────────────────────
+  // Always divide by 7 (not last7.length) - new users on Day 2 should
+  // show 14% completeness, not a misleading 100%.
+  const sessionsWithRealData = last7.filter(s =>
+    (s.phoneMetrics?.totalSwitches ?? 0) > 0 ||
+    Object.keys(s.desktopSessions ?? {}).length > 0
+  ).length;
+  const data_completeness_pct = Math.round((sessionsWithRealData / 7) * 100);
+
+  // ── Sanctuary Active Tier ─────────────────────────────────────────────────
+  // Tier 0 = always visible, Tier 1 = debt > 50%, Tier 2 = debt > 75%
+  const sanctuary_active_tier: 0 | 1 | 2 =
+    debtScore >= 75 ? 2
+    : debtScore >= 50 ? 1
+    : 0;
 
   // ── Weekly Load Index ──────────────────────────────────────────────────────
   const weeklyLoads = [
@@ -363,7 +433,7 @@ export function computeDerivedDayMetrics(
     date: today.date,
 
     cognitive_debt_score_pct: debtScore,
-    cognitive_debt_points_absolute: debtPoints,
+    cognitive_debt_points_absolute: debtPointsWithCarryover,
     cognitive_debt_severity: debtSeverity,
     cognitive_debt_history_6h: history6h,
     cognitive_debt_wow_change_pct: wowDebt,
@@ -387,7 +457,7 @@ export function computeDerivedDayMetrics(
     device_pickups_vs_avg_label: pickupsVsAvg,
 
     attention_residue_level: residueLevel,
-    attention_residue_score_pct: residuePct,
+    attention_residue_score_pct: blendedResiduePct,
     attention_residue_trend_7d: residueTrend7d,
     attention_residue_baseline_delta: residueDelta,
 
@@ -396,12 +466,13 @@ export function computeDerivedDayMetrics(
     working_memory_neural_noise_index: neuralNoise,
 
     focus_blocks_duration_minutes_today: totalFocusMin,
-    focus_blocks_pct_change_vs_last_month: focusMoM,
+    focus_blocks_pct_change_vs_last_week: focusWoW,
 
     stress_peak_hour: peakHour,
     stress_peak_vs_avg_label: peakVsAvg,
 
     recovery_duration_minutes_today: recoveryMinutes,
+    recovery_verified_break_minutes: verifiedBreakMinutes,
     recovery_coefficient_by_period: coeff,
     recovery_vs_last_month_label: recoveryMoM,
 
@@ -428,10 +499,14 @@ export function computeDerivedDayMetrics(
     readiness_recommendation_text: recText,
 
     cognitive_load_index_weekly: weeklyLoads,
+    cognitive_load_index_daily,
+    cognitive_load_index_monthly,
     cognitive_load_index_wow_change_pct: wowWeekly,
 
     data_sync_last_synced_at: lastSyncedAt,
     data_sync_status: syncStatus,
+    data_completeness_pct,
+    sanctuary_active_tier,
 
     combined_load: today.combinedLoad ?? debtScore,
     dual_fragmentation: today.dualFragmentation ?? 0,

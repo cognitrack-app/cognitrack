@@ -129,6 +129,9 @@ export interface SessionDocument {
   combinedSwitchVelocityPeak?: number;
   combinedHourlyLoad?: number[];  // element-wise max(phone, desktop) per hour
   lastMergeRun?: string;
+  /** Written by dailyReset Cloud Function each morning. */
+  carryover_debt_pts?:  number;
+  carryover_residue?:   number;   // 0–100
 }
 
 // ─── User Config (Firestore: /users/{uid}/config/preferences) ─────────────────
@@ -149,6 +152,19 @@ export interface UserConfig {
 
   created_at: string;
   last_calibrated_at: string;
+}
+
+export interface RecoveryRadar {
+  /** Time off-screen vs sleep_target_hours. 0–1, higher = more rest. */
+  sleep:     number;
+  /** Focus minutes / 240 (4h = perfect). 0–1. */
+  focus:     number;
+  /** 1 - (wm_strain / 100). Inverted — higher = less strain. 0–1. */
+  wm_strain: number;
+  /** Verified break minutes / (8h target). 0–1. */
+  recovery:  number;
+  /** Circadian alignment: 1 - |peakHour - 14| / 12. 0–1. */
+  circadian: number;
 }
 
 // ─── Derived Day Metrics (Firestore: /users/{uid}/derived/{date}) ─────────────
@@ -196,7 +212,8 @@ export interface DerivedDayMetrics {
 
   // ── Focus Blocks
   focus_blocks_duration_minutes_today: number;
-  focus_blocks_pct_change_vs_last_month: number;
+  /** Compares today vs the 7-day rolling average (renamed from _vs_last_month). */
+  focus_blocks_pct_change_vs_last_week: number;
 
   // ── Stress Peak
   stress_peak_hour: number;                   // 0–23
@@ -204,6 +221,8 @@ export interface DerivedDayMetrics {
 
   // ── Recovery
   recovery_duration_minutes_today: number;
+  /** Sum of break_events.duration_minutes where efficiency_pct >= 40. */
+  recovery_verified_break_minutes: number;
   recovery_coefficient_by_period: {
     morning: number;
     noon: number;
@@ -224,13 +243,7 @@ export interface DerivedDayMetrics {
   heatmap_weekly: number[][];                 // [7][24] — 7 days x 24 hours
 
   // ── Recovery Radar (5 axes)
-  recovery_radar: {
-    sleep: number;
-    focus: number;
-    wm_strain: number;
-    recovery: number;
-    circadian: number;
-  };
+  recovery_radar: RecoveryRadar;
 
   // ── Tomorrow's Readiness
   readiness_projected_baseline_pct: number;
@@ -239,13 +252,22 @@ export interface DerivedDayMetrics {
   readiness_circadian_alignment: 'GOOD' | 'MODERATE' | 'POOR';
   readiness_recommendation_text: string;
 
-  // ── Weekly Load Index
-  cognitive_load_index_weekly: number[];      // 7 values Mon–Sun
+  // ── Load Indices (powers Day / Week / Month toggle)
+  /** 7 values Mon–Sun for the Week toggle view. */
+  cognitive_load_index_weekly: number[];
+  /** 24-element per-hour load for the Day toggle view. */
+  cognitive_load_index_daily: number[];
+  /** 30-element per-day load for the Month toggle view. */
+  cognitive_load_index_monthly: number[];
   cognitive_load_index_wow_change_pct: number;
 
   // ── Data Sync
   data_sync_last_synced_at: string;
   data_sync_status: 'LIVE' | 'DELAYED' | 'OFFLINE';
+  /** 0–100: percentage of the last 7 days that have real session data. */
+  data_completeness_pct: number;
+  /** Active protocol tier based on current debt score. */
+  sanctuary_active_tier: 0 | 1 | 2;
 
   // ── Cross-device (from SessionDocument merge)
   combined_load: number;

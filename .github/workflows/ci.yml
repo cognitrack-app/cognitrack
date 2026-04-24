@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+
+jobs:
+  typecheck-and-test:
+    name: Typecheck & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck (shared)
+        run: pnpm --filter @cognitrack/shared exec tsc --noEmit
+
+      - name: Typecheck (functions)
+        run: pnpm --filter cognitrack-functions exec tsc --noEmit
+
+      - name: Typecheck (desktop)
+        run: pnpm --filter cognitrack-desktop exec tsc --noEmit
+
+      - name: Run tests
+        run: pnpm test --if-present

@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "lib": ["ES2022"],
+    "outDir": "dist-electron",
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": false,
+    "sourceMap": true,
+    "jsx": "react-jsx"
+  },
+  "include": [
+    "src/index.ts",
+    "src/electron/**/*.ts",
+    "src/types/**/*.ts"
+  ],
+  "exclude": [
+    "src/renderer/**",
+    "node_modules",
+    "dist-electron",
+    "dist-renderer"
+  ]
+}
