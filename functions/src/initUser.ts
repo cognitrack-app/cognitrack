@@ -40,11 +40,23 @@ export const initUser = onDocumentCreated(
     const existing = await configRef.get();
     if (existing.exists) return;
 
-    // Try to fetch display name from Auth
+    // Try to fetch display name from Auth.
+    // For email/password accounts displayName is always null — fall back to
+    // the email local-part (e.g. "gaurav.pandey@gmail.com" → "Gaurav Pandey").
     let displayName = 'User';
     try {
       const authUser = await getAuth().getUser(uid);
-      displayName = authUser.displayName ?? 'User';
+      if (authUser.displayName) {
+        displayName = authUser.displayName;
+      } else if (authUser.email) {
+        // Convert email local-part to a human-readable name:
+        //   gaurav.pandey → Gaurav Pandey
+        //   john_doe      → John Doe
+        displayName = authUser.email
+          .split('@')[0]!
+          .replace(/[._-]+/g, ' ')
+          .replace(/\b\w/g, (c) => c.toUpperCase());
+      }
     } catch (_) {
       // Auth record may not exist yet in emulator; safe to ignore
     }

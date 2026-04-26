@@ -99,6 +99,44 @@ export class SyncQueue {
     ).run(maxRetries);
   }
 
+  /**
+   * Resets items stuck in 'syncing' back to 'pending'.
+   *
+   * An item is stranded in 'syncing' when the app crashes between
+   * updateItemStatus(id, 'syncing') and updateItemStatus(id, 'synced').
+   * getPendingItems() only fetches 'pending' rows, so these items would
+   * be silently abandoned forever without this recovery step.
+   *
+   * Call this BEFORE requeueFailed() on every startup (setOnline(true)).
+   */
+  requeueStuckSyncing(): void {
+    const result = this.db.prepare(
+      `UPDATE queue SET status = 'pending', updated_at = ? WHERE status = 'syncing'`
+    ).run(new Date().toISOString());
+    if (result.changes > 0) {
+      console.log(`[queue] Recovered ${result.changes} item(s) stuck in 'syncing' state`);
+    }
+  }
+
+  /**
+   * Deletes successfully synced rows older than `olderThanDays` (default 7).
+   *
+   * 'synced' rows accumulate at ~1/hour and are never automatically removed,
+   * causing the queue DB to grow ~70 rows/week and the tray popover's 'total'
+   * counter to show a meaningless lifetime total rather than recent activity.
+   *
+   * Safe to call after every flush — a no-op when there is nothing to prune.
+   */
+  pruneOldSynced(olderThanDays = 7): void {
+    const cutoff = new Date(Date.now() - olderThanDays * 86_400_000).toISOString();
+    const result = this.db.prepare(
+      `DELETE FROM queue WHERE status = 'synced' AND updated_at < ?`
+    ).run(cutoff);
+    if (result.changes > 0) {
+      console.log(`[queue] Pruned ${result.changes} synced item(s) older than ${olderThanDays}d`);
+    }
+  }
+
   deleteItem(id: string): void {
     this.db.prepare('DELETE FROM queue WHERE id = ?').run(id);
   }

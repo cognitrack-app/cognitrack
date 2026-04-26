@@ -111,8 +111,10 @@ export function calculateCognitiveDebt(events: AppEvent[]): CognitiveReport {
       // 4. Adjusted switch cost
       const adjustedCost = switchCost * velocityMult;
 
-      // 5. Stack new residue on top of decayed old residue
-      state.residue = applySwitch(state.residue, timeSinceLast, switchCost);
+      // 5. Stack new residue on top of decayed old residue (use adjustedCost
+      //    so the velocity multiplier amplifies residue at the same rate as
+      //    it amplifies debt contribution in step 8)
+      state.residue = applySwitch(state.residue, timeSinceLast, adjustedCost);
 
       // 6. Deplete working memory
       state.wm_capacity = updateWorkingMemory(
