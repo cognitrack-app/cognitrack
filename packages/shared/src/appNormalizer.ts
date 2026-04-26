@@ -36,7 +36,13 @@ const WIN_APP_MAP: Record<string, string> = {
   'figma':            'win.figma',
   'microsoft word':   'win.word',
   'microsoft excel':  'win.excel',
-  'outlook':          'win.outlook',
+  // AI tools
+  'windsurf':          'win.windsurf',
+  'claude':            'win.claude',
+  'chatgpt':           'win.chatgpt',
+  // Password manager
+  '1password':         'win.1password',
+  '1password 7':       'win.1password',
 };
 
 // ─── macOS app name → canonical ID ─────────────────────────────────────────
@@ -70,6 +76,20 @@ const MAC_APP_MAP: Record<string, string> = {
   'finder':           'mac.finder',
   'mail':             'mac.mail',
   'messages':         'mac.messages',
+  // IDEs present in WIN_APP_MAP but missing from MAC_APP_MAP
+  'pycharm':          'mac.pycharm',
+  'android studio':   'mac.androidstudio',
+  // macOS-specific browser
+  'arc':              'mac.arc',
+  // AI tools
+  'windsurf':         'mac.windsurf',
+  'claude':           'mac.claude',
+  'chatgpt':          'mac.chatgpt',
+  // Productivity / project management
+  'linear':           'mac.linear',
+  // Password manager
+  '1password':        'mac.1password',
+  '1password 7':      'mac.1password',
 };
 
 // ─── Category map (canonical ID → Category) ──────────────────────────────
@@ -87,6 +107,7 @@ const CATEGORY_MAP: Record<string, Category> = {
   'win.obsidian':       'productive',
   'win.word':           'productive',
   'win.excel':          'productive',
+  'win.windsurf':       'productive',
   'mac.vscode':         'productive',
   'mac.cursor':         'productive',
   'mac.webstorm':       'productive',
@@ -96,7 +117,11 @@ const CATEGORY_MAP: Record<string, Category> = {
   'mac.postman':        'productive',
   'mac.notion':         'productive',
   'mac.obsidian':       'productive',
-  // — Tools (browsers, communication, shell)
+  'mac.pycharm':        'productive',
+  'mac.androidstudio':  'productive',
+  'mac.windsurf':       'productive',
+  'mac.linear':         'productive',
+  // — Tools (browsers, communication, shell, AI assistants, utilities)
   'win.chrome':         'tools',
   'win.edge':           'tools',
   'win.firefox':        'tools',
@@ -108,11 +133,15 @@ const CATEGORY_MAP: Record<string, Category> = {
   'win.outlook':        'tools',
   'win.docker':         'tools',
   'win.explorer':       'tools',
+  'win.claude':         'tools',
+  'win.chatgpt':        'tools',
+  'win.1password':      'tools',
   'mac.chrome':         'tools',
   'mac.safari':         'tools',
   'mac.firefox':        'tools',
   'mac.edge':           'tools',
   'mac.brave':          'tools',
+  'mac.arc':            'tools',
   'mac.terminal':       'tools',
   'mac.slack':          'tools',
   'mac.teams':          'tools',
@@ -120,6 +149,9 @@ const CATEGORY_MAP: Record<string, Category> = {
   'mac.mail':           'tools',
   'mac.docker':         'tools',
   'mac.finder':         'tools',
+  'mac.claude':         'tools',
+  'mac.chatgpt':        'tools',
+  'mac.1password':      'tools',
   // — Entertainment
   'win.spotify':        'entertainment',
   'win.vlc':            'entertainment',

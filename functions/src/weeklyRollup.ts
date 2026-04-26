@@ -112,8 +112,12 @@ export const weeklyRollup = onSchedule(
       );
       const focusMinutes = validSessions.map(s => {
         const pp = s.phoneMetrics;
+        // categoryBreakdown.productive is a 0-100 percentage, NOT a 0-1 fraction.
+        // Divide by 100 before multiplying by totalScreenTime*60 to get minutes.
+        // Without the /100, a typical day (30% productive, 6h screen) gives
+        // 6 * 60 * 30 = 10,800 minutes which is physically impossible.
         return pp
-          ? Math.round(pp.totalScreenTime * 60 * (pp.categoryBreakdown.productive ?? 0))
+          ? Math.round(pp.totalScreenTime * 60 * ((pp.categoryBreakdown.productive ?? 0) / 100))
           : 0;
       });
       const recoveryMinutes = validSessions.map(s => {
@@ -132,12 +136,31 @@ export const weeklyRollup = onSchedule(
       let peakDebtIdx = 0;
       combinedLoads.forEach((v, i) => { if (v > (combinedLoads[peakDebtIdx] ?? 0)) peakDebtIdx = i; });
 
-      // Total breaches across week
+      // Total breaches across the week — mirrors derivations.ts combined velocity formula.
+      // Phone-only was BUG H-1: for desktop-primary users this always returned 0.
       const totalBreaches = validSessions.reduce((sum, s) => {
-        const p = s.phoneMetrics;
-        if (!p) return sum;
         const critThreshold = config.switch_critical_threshold ?? 80;
-        return sum + p.hourlyLoad.filter(l => (l / 100) * critThreshold * 1.2 > critThreshold).length;
+        const p = s.phoneMetrics;
+
+        // Build a 24-element desktop hourly array: max across all desktop sessions per hour.
+        const desktopHourly: number[] = Object.values(s.desktopSessions ?? {}).reduce(
+          (acc: number[], d) =>
+            Array.from({ length: 24 }, (_, i) => Math.max(acc[i] ?? 0, d.hourlyLoad[i] ?? 0)),
+          Array<number>(24).fill(0)
+        );
+
+        if (!p && desktopHourly.every(v => v === 0)) return sum;
+
+        // Convert hourly load percentages to velocity units (same weights as derivations.ts):
+        // phone contributes 120% of threshold-equivalent, desktop 80%.
+        const phoneVel   = (p?.hourlyLoad ?? Array<number>(24).fill(0)).map(l =>
+          Math.round((l / 100) * critThreshold * 1.2));
+        const desktopVel = desktopHourly.map(l =>
+          Math.round((l / 100) * critThreshold * 0.8));
+        const combined   = phoneVel.map((v, i) =>
+          Math.min(100, v + (desktopVel[i] ?? 0)));
+
+        return sum + combined.filter(v => v > critThreshold).length;
       }, 0);
 
       const report: WeeklyReport = {

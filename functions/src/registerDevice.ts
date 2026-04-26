@@ -21,8 +21,8 @@ export const registerDevice = onCall(
       .set({
         displayName,
         platform,
-        lastSeen: FieldValue.serverTimestamp(),
-        registeredAt: FieldValue.serverTimestamp(),
+        lastSeenAt:    FieldValue.serverTimestamp(),
+        registeredAt:  FieldValue.serverTimestamp(),
       }, { merge: true });  // merge: true makes it safe to call on every launch
 
     return { success: true };

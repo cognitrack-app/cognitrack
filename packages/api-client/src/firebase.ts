@@ -12,6 +12,25 @@ const firebaseConfig = {
   appId:             process.env.FIREBASE_APP_ID!,
 };
 
+// ─── Dev-time guard: fail immediately with a helpful message ─────────────────
+// Vite bakes .env values into the bundle at build-time.  If the .env file
+// is still unfilled (placeholder strings or empty), the Firebase SDK will throw
+// the cryptic `auth/invalid-api-key` error deep inside an async callstack.
+// This guard converts that into a readable build-time failure.
+const PLACEHOLDER_PATTERNS = [
+  'your-', 'REPLACE_WITH', '123456789', 'abcdef', '',
+] as const;
+
+for (const [key, value] of Object.entries(firebaseConfig)) {
+  if (!value || PLACEHOLDER_PATTERNS.some((p) => value.includes(p))) {
+    throw new Error(
+      `[CogniTrack] Firebase config key "${key}" is missing or still a placeholder.\n` +
+      `Fill in cognitrack-desktop/.env with real values from the Firebase console.\n` +
+      `Run: flutterfire configure --project=cognitrack-dcede  (or copy from Firebase Console → Project Settings → Web app)`,
+    );
+  }
+}
+
 const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
 
 export const db: Firestore = getFirestore(app);

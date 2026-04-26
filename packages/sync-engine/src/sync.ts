@@ -14,6 +14,10 @@ export class SyncEngine {
   setOnline(online: boolean): void {
     this.isOnline = online;
     if (online) {
+      // Recover any items frozen in 'syncing' by a previous crash — must run
+      // BEFORE requeueFailed so the count is accurate and all retryable items
+      // are in 'pending' state before the flush picks them up.
+      this.queue.requeueStuckSyncing();
       this.queue.requeueFailed();
       void this.flush();
     }
@@ -55,6 +59,9 @@ export class SyncEngine {
       }
     } finally {
       this.isSyncing = false;
+      // Prune synced rows older than 7 days after every flush cycle.
+      // Keeps the queue DB lean and the tray popover 'total' counter meaningful.
+      this.queue.pruneOldSynced();
     }
   }
 
@@ -62,6 +69,14 @@ export class SyncEngine {
    * Last-write-wins conflict resolution.
    * Compares lastUpdated ISO timestamps from two DesktopSyncPayloads.
    * Returns whichever was updated more recently.
+   *
+   * NOTE: This method is intentionally NOT called inside flush(). The current
+   * conflict resolution strategy is Firestore's own merge semantics
+   * (setDoc with merge:true), which effectively gives last-write-wins at the
+   * field level. For a single desktop writing to its own deviceId key this is
+   * sufficient. If multi-device conflict resolution is added in the future,
+   * call this before writeDesktopSession(): fetch the remote document,
+   * pass both payloads here, then write only if local wins.
    */
   resolveConflict(local: DesktopSyncPayload, remote: DesktopSyncPayload): DesktopSyncPayload {
     return new Date(local.lastUpdated) >= new Date(remote.lastUpdated) ? local : remote;

@@ -37,20 +37,31 @@ export async function registerDevice(
   // ✔ Correct path: users/{userId}/devices/{deviceId}
   const ref = doc(db, 'users', userId, 'devices', deviceId);
 
-  const deviceData: Device = {
+  // Read existing document FIRST.
+  // setDoc with merge:true does NOT protect fields from being overwritten —
+  // it only skips creating missing nested maps. Including registeredAt on every
+  // write would silently reset the original registration date each launch.
+  const existing = await getDoc(ref);
+
+  const base = {
     deviceId,
     userId,
     platform,
     displayName,
     appVersion,
-    type: platform === 'android' || platform === 'ios' ? 'mobile' : 'desktop',
-    registeredAt: serverTimestamp(),
-    lastSeenAt:   serverTimestamp(),
+    type: (platform === 'android' || platform === 'ios' ? 'mobile' : 'desktop') as Device['type'],
+    lastSeenAt: serverTimestamp(),
   };
 
+  // Only set registeredAt when the document is being created for the first time.
+  const deviceData = existing.exists()
+    ? base
+    : { ...base, registeredAt: serverTimestamp() };
+
   await setDoc(ref, deviceData, { merge: true });
-  return deviceData;
+  return deviceData as Device;
 }
+
 
 /**
  * Fetch a single device record.
