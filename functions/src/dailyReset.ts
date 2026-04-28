@@ -28,15 +28,25 @@ const DEBT_PTS_PER_SLEEP_HOUR = 4;
 const OVERNIGHT_RESIDUE_DECAY = 0.15; // 15% of residue remains after a full night
 
 export const dailyReset = onSchedule(
-  // Run at 07:00 CEST by default. Individual wake_hour config is checked
-  // per-user below — users who have a different wake_hour will still get
-  // correct carryover values when their first session write triggers merge.ts.
+  // Runs at 07:00 CEST for all users.
+  // CLOUD-03 FIX: The previous comment claimed a per-user wake_hour check
+  // was performed below — no such check exists. All users receive carryover
+  // at 07:00. Users who wake earlier will have their first events processed
+  // by merge.ts with zero carryover until this function fires. A true
+  // per-user wake_hour gate would require per-user scheduled functions which
+  // are not supported by Firebase Cloud Functions v2 Scheduler.
   { schedule: '0 7 * * *', timeZone: 'Europe/Copenhagen' },
   async () => {
     const db = getFirestore();
 
     const today = new Date().toISOString().split('T')[0]!;
-    const yesterday = new Date(Date.now() - 86_400_000).toISOString().split('T')[0]!;
+    // CLOUD-02 FIX: Use date arithmetic (setDate/getDate) instead of
+    // Date.now() - 86_400_000. On DST spring-forward days the actual day is
+    // only 23 hours long, so subtracting a fixed 86_400_000ms (24h) overshoots
+    // by one day and reads the wrong derived document for carryover.
+    const yesterdayDate = new Date();
+    yesterdayDate.setDate(yesterdayDate.getDate() - 1);
+    const yesterday = yesterdayDate.toISOString().split('T')[0]!;
 
     const usersSnap = await db.collection('users').get();
 

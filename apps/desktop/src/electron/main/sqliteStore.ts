@@ -179,7 +179,7 @@ export class SQLiteStore {
 
     const rows = this.db.prepare(`
       SELECT
-        CAST((timestamp / 3600000) AS INTEGER) % 24 AS hour,
+        CAST(strftime('%H', timestamp / 1000, 'unixepoch', 'localtime') AS INTEGER) AS hour,
         COUNT(*) AS switches
       FROM app_events
       WHERE timestamp >= ? AND timestamp < ? AND eventType = 'switch'

@@ -40,6 +40,15 @@ export class ActiveWindowTracker {
   private lastAppId: string | null = null;
   private lastSwitchTs = Date.now();
   private running = false;
+  /**
+   * DESK-01 FIX: True while we are in a continuous idle session.
+   * Without this guard, poll() calls recordBreak() every 5 s while idle,
+   * flooding SQLite with duplicate idle rows. detectBreakEvents() looks for
+   * gaps ≥ 5 min between consecutive events — with rows 5 s apart no gap
+   * ever qualifies, so break_events is always []. We insert ONE idle marker
+   * per idle session and clear the flag when the user becomes active again.
+   */
+  private isIdle = false;
 
   constructor(private readonly store: SQLiteStore) {}
 
@@ -134,6 +143,9 @@ export class ActiveWindowTracker {
 
       this.lastAppId = appId;
       this.lastSwitchTs = now;
+      // DESK-01 FIX: Returning from idle — clear the guard so the next
+      // break period will insert a fresh idle marker.
+      this.isIdle = false;
     }
   }
 
@@ -144,6 +156,13 @@ export class ActiveWindowTracker {
   };
 
   private recordBreak(): void {
+    // DESK-01 FIX: Only insert ONE idle event per continuous idle session.
+    // poll() calls this every 5 s while idleSeconds >= threshold; without
+    // this guard a 10-minute break generates ~120 duplicate SQLite rows,
+    // and detectBreakEvents() never finds a gap >= 5 min between them.
+    if (this.isIdle) return;
+    this.isIdle = true;
+
     const now = Date.now();
     this.store.insertEvent({
       timestamp: now,

@@ -416,9 +416,12 @@ export function computeDerivedDayMetrics(
     debtScore,
   ].slice(-7);
   while (weeklyLoads.length < 7) weeklyLoads.unshift(0);
-  const prevWeekAvg = avgArr(weeklyLoads.slice(0, 6));
-  const wowWeekly = prevWeekAvg === 0 ? 0
-    : Math.round(((debtScore - prevWeekAvg) / prevWeekAvg) * 100);
+  // CLOUD-DERIVE-02 FIX: The old code computed (today - avg_last_6) / avg_last_6
+  // and labelled it "wow" (week-over-week). That is NOT week-over-week — it
+  // compares today vs a rolling 6-day average, which contradicts wowDebt above
+  // (which correctly compares today vs the same weekday 7 sessions ago).
+  // Reuse wowDebt so both fields are consistent and accurate.
+  const wowWeekly = wowDebt;
 
   // ── Data Sync Status ───────────────────────────────────────────────────────
   const lastSyncedAt = p?.lastUpdated ?? primaryDesktop?.lastUpdated ?? new Date().toISOString();
@@ -510,7 +513,13 @@ export function computeDerivedDayMetrics(
 
     combined_load: today.combinedLoad ?? debtScore,
     dual_fragmentation: today.dualFragmentation ?? 0,
-    phone_interrupts_during_work: today.phoneInterruptsDuringWork ?? 0,
+    // CLOUD-DERIVE-01 FIX: merge.ts renamed phoneInterruptsDuringWork to
+    // phoneHighLoadOverlapHours. The old field name is undefined on all
+    // documents written after the CLOUD-04 fix, making this always 0.
+    // Read the new field first; fall back to the old name for documents
+    // written before the rename (backward compatibility).
+    phone_interrupts_during_work:
+      today.phoneHighLoadOverlapHours ?? today.phoneInterruptsDuringWork ?? 0,
     combined_switches_total: combinedSwitchesTotal,
     combined_switch_velocity_peak: combinedSwitchVelocityPeak,
     combined_hourly_load: combinedHourlyLoad,

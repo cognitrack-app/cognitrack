@@ -40,22 +40,31 @@ export class SyncEngine {
    * Flush all pending items to Firestore.
    * Guards against concurrent calls with isSyncing flag.
    * No-op when offline.
+   *
+   * B5 FIX: drain the full queue, not just the first batch of 20.
+   * getPendingItems() caps at 20 rows per call. After 3+ days offline
+   * (~48 queued hourly pushes) only the first 20 would sync on reconnect;
+   * the remaining 28 waited for the next natural connectivity event.
+   * The while-loop re-fetches until getPendingItems() returns an empty array.
    */
   async flush(): Promise<void> {
     if (!this.isOnline || this.isSyncing) return;
     this.isSyncing = true;
     try {
-      const pending = this.queue.getPendingItems();
-      for (const item of pending) {
-        this.queue.updateItemStatus(item.id, 'syncing');
-        try {
-          const { userId, date, deviceId, session } = item.data;
-          await writeDesktopSession(userId, date, deviceId, session);
-          this.queue.updateItemStatus(item.id, 'synced');
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          this.queue.updateItemStatus(item.id, 'failed', msg);
+      let pending = this.queue.getPendingItems(); // batch = 20
+      while (pending.length > 0) {
+        for (const item of pending) {
+          this.queue.updateItemStatus(item.id, 'syncing');
+          try {
+            const { userId, date, deviceId, session } = item.data;
+            await writeDesktopSession(userId, date, deviceId, session);
+            this.queue.updateItemStatus(item.id, 'synced');
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            this.queue.updateItemStatus(item.id, 'failed', msg);
+          }
         }
+        pending = this.queue.getPendingItems(); // fetch next batch
       }
     } finally {
       this.isSyncing = false;

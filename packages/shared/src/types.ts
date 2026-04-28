@@ -123,7 +123,8 @@ export interface SessionDocument {
   // Set by mergeAgentData Cloud Function:
   combinedLoad?: number;
   dualFragmentation?: number;
-  phoneInterruptsDuringWork?: number;
+  phoneInterruptsDuringWork?: number;     // deprecated — kept for backward compat
+  phoneHighLoadOverlapHours?: number;     // CLOUD-04: renamed from phoneInterruptsDuringWork
   // Combined switch stream across all devices — set by merge:
   combinedSwitchesTotal?: number;
   combinedSwitchVelocityPeak?: number;

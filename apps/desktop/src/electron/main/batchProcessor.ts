@@ -31,7 +31,10 @@ function detectBreakEvents(
     const endDate        = new Date(next.timestamp);
     const durationMinutes = Math.round(gap / 60_000);
 
-    const hourBefore  = Math.max(0, startDate.getHours() - 1);
+    // DESK-02 FIX: Use startDate.getHours() directly (the hour the break
+    // started), not getHours() - 1. The -1 read the previous hour's debt
+    // bucket, which is already decayed and underestimates break efficiency.
+    const hourBefore  = startDate.getHours();
     const hourAfter   = Math.min(23, endDate.getHours());
     const debtBefore  = hourlyDebt[hourBefore] ?? 0;
     const debtAfter   = hourlyDebt[hourAfter]  ?? 0;

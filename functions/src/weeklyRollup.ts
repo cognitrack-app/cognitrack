@@ -41,6 +41,11 @@ export const weeklyRollup = onSchedule(
     for (const userDoc of usersSnap.docs) {
       const uid = userDoc.id;
 
+    // CLOUD-05 FIX: Wrap per-user processing in try/catch so one bad user
+    // document (missing field, Firestore permission error, etc.) cannot
+    // abort the entire function and leave all subsequent users with no
+    // weekly report. Errors are logged per-user and processing continues.
+    try {
       // Fetch user config
       const configSnap = await db
         .collection('users').doc(uid)
@@ -197,7 +202,6 @@ export const weeklyRollup = onSchedule(
       // ──────────────────────────────────────────────────────────────────────────────
       const SIX_DAYS_MS = 6 * 24 * 60 * 60 * 1000;
       const lastCal = new Date(config.last_calibrated_at).getTime();
-      const createdAt = new Date(config.created_at).getTime();
       const needsCalibration =
         (config.last_calibrated_at === config.created_at ||
           Date.now() - lastCal >= SIX_DAYS_MS) &&
@@ -244,6 +248,11 @@ export const weeklyRollup = onSchedule(
           `debtCritical=${Math.max(50, Math.min(90, newDebtCritical))}`
         );
       }
+    } catch (userErr) {
+      // CLOUD-05 FIX: Isolate per-user errors so one failing user cannot abort
+      // the entire weekly rollup and leave all subsequent users with no report.
+      console.error(`❌ weeklyRollup failed for uid=${uid}: ${userErr}`);
     }
+  }
   }
 );
