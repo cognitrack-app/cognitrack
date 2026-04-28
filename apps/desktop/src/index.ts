@@ -80,7 +80,12 @@ app.whenReady().then(async () => {
   // 11. Start the active window tracker
   tracker.start();
 
-  // 13. Hourly batch: compute cognitive metrics and sync to Firestore
+  // DESK-06 FIX: Refresh tray menu now that tracker is running — buildTrayMenu()
+  // was called during createTray() at step 6, before tracker.start(), so the
+  // initial menu incorrectly showed "○ Tracking Paused" on every cold launch.
+  tray?.setContextMenu(buildTrayMenu());
+
+  // 12. Hourly batch: compute cognitive metrics and sync to Firestore
   scheduleHourlyBatch();
 
 
@@ -234,14 +239,35 @@ function scheduleHourlyBatch(): void {
 
 // ── Helper: wait for sign-in signal from renderer ────────────────────────
 
+/**
+ * DESK-04 FIX: Returns a Promise that:
+ *  - Resolves with the UID when the renderer emits 'auth:signedIn' with a
+ *    valid Firebase UID (>= 20 chars).
+ *  - Rejects immediately with a descriptive error if the UID is malformed,
+ *    so startup fails loudly instead of hanging silently forever.
+ *  - Rejects after 5 minutes if the renderer never fires the event at all
+ *    (e.g. sign-in page crashed or renderer failed to load).
+ *
+ * Previous bug: on invalid UID the code logged an error and returned,
+ * leaving the Promise permanently pending with no timeout or rejection.
+ * The entire startup chain (await waitForAuthFromRenderer()) froze.
+ */
 function waitForAuthFromRenderer(): Promise<string> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
+    // Safety net: reject after 5 minutes if renderer never fires the event
+    const timeout = setTimeout(() => {
+      ipcMain.removeAllListeners('auth:signedIn');
+      reject(new Error('[auth] Timeout: renderer did not emit auth:signedIn within 5 minutes'));
+    }, 5 * 60 * 1000);
+
     ipcMain.once('auth:signedIn', (_event, uid: string) => {
-      if (typeof uid !== 'string' || !/^[a-zA-Z0-9]{20,128}$/.test(uid)) {
-        console.error('[auth] Invalid UID received from renderer');
+      clearTimeout(timeout);
+      if (typeof uid !== 'string' || uid.trim().length < 20) {
+        // Reject loudly — caller can surface this as a visible error
+        reject(new Error(`[auth] Invalid UID from renderer: "${uid}"`));
         return;
       }
-      resolve(uid);
+      resolve(uid.trim());
     });
   });
 }

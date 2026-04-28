@@ -94,8 +94,15 @@ export const mergeAgentData = onDocumentWritten(
         phone!.cognitiveLoadPct * 0.55 + primaryDesktop.cognitiveLoadPct * 0.45
       );
 
-      // Phone interrupts during desktop work hours
-      const phoneInterruptsDuringWork = primaryDesktop.hourlyLoad.reduce(
+      // CLOUD-04 FIX: This metric counts the number of HOURS in the day where
+      // both desktop load was > 30% AND phone load was > 20% simultaneously.
+      // This is NOT an interruption count — a user who checks their phone
+      // briefly 20 times in one hour still registers as 1 overlap hour, while
+      // a user who checks it once across 5 different work hours registers as 5.
+      // Renamed phoneHighLoadOverlapHours to accurately describe the metric.
+      // The UI should label this "Hours of concurrent phone & desktop load",
+      // not "Interruptions During Work".
+      const phoneHighLoadOverlapHours = primaryDesktop.hourlyLoad.reduce(
         (count, desktopLoad, hour) => {
           const phoneLoad = phone!.hourlyLoad[hour] ?? 0;
           return desktopLoad > 30 && phoneLoad > 20 ? count + 1 : count;
@@ -124,7 +131,7 @@ export const mergeAgentData = onDocumentWritten(
       await sessionRef.update({
         combinedLoad,
         dualFragmentation: fragReport.score,
-        phoneInterruptsDuringWork,
+        phoneHighLoadOverlapHours,   // CLOUD-04: renamed from phoneInterruptsDuringWork
         combinedSwitchesTotal,
         combinedSwitchVelocityPeak,
         combinedHourlyLoad,
@@ -132,17 +139,17 @@ export const mergeAgentData = onDocumentWritten(
       });
 
       // Refresh data snapshot with the merged fields before Pass 2
-      data.combinedLoad               = combinedLoad;
-      data.dualFragmentation           = fragReport.score;
-      data.phoneInterruptsDuringWork   = phoneInterruptsDuringWork;
-      data.combinedSwitchesTotal       = combinedSwitchesTotal;
-      data.combinedSwitchVelocityPeak  = combinedSwitchVelocityPeak;
-      data.combinedHourlyLoad          = combinedHourlyLoad;
+      data.combinedLoad                = combinedLoad;
+      data.dualFragmentation            = fragReport.score;
+      data.phoneHighLoadOverlapHours    = phoneHighLoadOverlapHours; // CLOUD-04: renamed
+      data.combinedSwitchesTotal        = combinedSwitchesTotal;
+      data.combinedSwitchVelocityPeak   = combinedSwitchVelocityPeak;
+      data.combinedHourlyLoad           = combinedHourlyLoad;
 
       console.log(
         `✅ Merged ${date} for uid=${uid}: ` +
         `combinedLoad=${combinedLoad}%, frag=${fragReport.score}, ` +
-        `phoneInterrupts=${phoneInterruptsDuringWork}, ` +
+        `phoneHighLoadOverlapHours=${phoneHighLoadOverlapHours}, ` +
         `combinedSwitches=${combinedSwitchesTotal}`
       );
     }
