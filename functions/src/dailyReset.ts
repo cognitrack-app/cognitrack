@@ -27,28 +27,37 @@ import type { UserConfig } from '@cognitrack/shared';
 const DEBT_PTS_PER_SLEEP_HOUR = 4;
 const OVERNIGHT_RESIDUE_DECAY = 0.15; // 15% of residue remains after a full night
 
+/**
+ * Return YYYY-MM-DD for the date that is `offset` calendar days from `base`,
+ * shifted by `utcOffsetHours` so non-EU users get their own local date.
+ * Uses setDate arithmetic (DST-safe, no fixed 86400000 subtraction).
+ */
+function localDateString(base: Date, offsetDays: number, utcOffsetHours: number): string {
+  // Shift base to user's local noon to avoid midnight DST edge cases.
+  const local = new Date(base.getTime() + utcOffsetHours * 3_600_000);
+  local.setUTCDate(local.getUTCDate() + offsetDays);
+  return local.toISOString().split('T')[0]!;
+}
+
 export const dailyReset = onSchedule(
-  // Runs at 07:00 CEST for all users.
-  // CLOUD-03 FIX: The previous comment claimed a per-user wake_hour check
-  // was performed below — no such check exists. All users receive carryover
-  // at 07:00. Users who wake earlier will have their first events processed
-  // by merge.ts with zero carryover until this function fires. A true
-  // per-user wake_hour gate would require per-user scheduled functions which
-  // are not supported by Firebase Cloud Functions v2 Scheduler.
+  // MEDIUM-2 NOTE: Firebase Cloud Functions v2 Scheduler does not support
+  // per-user scheduled functions. This fires once at 07:00 CEST for all users.
+  //
+  // To approximate the correct date for each user we read a utcOffsetHours
+  // field from UserConfig (default 1 = CEST). When present we shift the date
+  // calculation so non-EU users get carryover seeded into their correct local
+  // date document rather than the server's Copenhagen date.
   { schedule: '0 7 * * *', timeZone: 'Europe/Copenhagen' },
   async () => {
     const db = getFirestore();
 
-    const today = new Date().toISOString().split('T')[0]!;
-    // CLOUD-02 FIX: Use date arithmetic (setDate/getDate) instead of
-    // Date.now() - 86_400_000. On DST spring-forward days the actual day is
-    // only 23 hours long, so subtracting a fixed 86_400_000ms (24h) overshoots
-    // by one day and reads the wrong derived document for carryover.
-    const yesterdayDate = new Date();
-    yesterdayDate.setDate(yesterdayDate.getDate() - 1);
-    const yesterday = yesterdayDate.toISOString().split('T')[0]!;
+    // Server wall-clock date (Copenhagen local = UTC+1/+2) — used as default.
+    // CLOUD-02 FIX: Use date arithmetic (setDate) rather than Date.now()-86400000
+    // so DST spring-forward days (23h) don't overshoot by one calendar day.
+    const serverNow = new Date();
 
     const usersSnap = await db.collection('users').get();
+
 
     for (const userDoc of usersSnap.docs) {
       const uid = userDoc.id;
@@ -60,12 +69,19 @@ export const dailyReset = onSchedule(
         .get();
 
       if (!configSnap.exists) continue;
-      const config = configSnap.data() as UserConfig;
+      const config = configSnap.data() as UserConfig & { utcOffsetHours?: number };
+
+      // MEDIUM-2 FIX: compute dates in the user's local timezone.
+      // utcOffsetHours is stored in UserConfig (e.g. -8 for PST, +5.5 for IST).
+      // Falls back to 1 (CEST) so existing EU users are unaffected.
+      const utcOffset = config.utcOffsetHours ?? 1;
+      const localToday     = localDateString(serverNow, 0,  utcOffset);
+      const localYesterday = localDateString(serverNow, -1, utcOffset);
 
       // ── Fetch yesterday's derived metrics ────────────────────────────────
       const yesterdayDerivedSnap = await db
         .collection('users').doc(uid)
-        .collection('derived').doc(yesterday)
+        .collection('derived').doc(localYesterday)
         .get();
 
       if (!yesterdayDerivedSnap.exists) {
@@ -92,7 +108,7 @@ export const dailyReset = onSchedule(
 
       if (carryoverDebt === 0 && carryoverResidue === 0) {
         // Full recovery — no carryover to seed
-        console.log(`✅ dailyReset uid=${uid}: full recovery, no carryover for ${today}`);
+        console.log(`✅ dailyReset uid=${uid}: full recovery, no carryover for ${localToday}`);
         continue;
       }
 
@@ -101,10 +117,10 @@ export const dailyReset = onSchedule(
       // may have already been written by an early-morning agent run.
       await db
         .collection('users').doc(uid)
-        .collection('sessions').doc(today)
+        .collection('sessions').doc(localToday)
         .set(
           {
-            date: today,
+            date: localToday,
             carryover_debt_pts: carryoverDebt,
             carryover_residue:  carryoverResidue,
           },
@@ -112,7 +128,7 @@ export const dailyReset = onSchedule(
         );
 
       console.log(
-        `✅ dailyReset uid=${uid}: ` +
+        `✅ dailyReset uid=${uid} (UTC${utcOffset >= 0 ? '+' : ''}${utcOffset}): ` +
         `unclearedYesterday=${unclearedDebt}pts → carryover=${carryoverDebt}pts, ` +
         `residueCarryover=${carryoverResidue}%`
       );

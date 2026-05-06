@@ -87,3 +87,4 @@ dist-renderer/
 .cursor/
 .windsurf/
 apps/desktop/.env
+.idea/
