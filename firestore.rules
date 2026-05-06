@@ -2,18 +2,47 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // ── User private data ────────────────────────────────────────────────────
-    // All subcollections under /users/{uid}/ are read/write only by that user.
-    match /users/{uid}/{document=**} {
+    // ── Sessions: agents (phone + desktop) write here ────────────────────────
+    // Clients may also read their own sessions for historical display.
+    match /users/{uid}/sessions/{date} {
       allow read, write: if request.auth != null && request.auth.uid == uid;
     }
 
-    // ── Protocols ────────────────────────────────────────────────────────────
-    // Any authenticated user can read protocols.
-    // Writes are blocked from clients — use Admin SDK via seedProtocols function.
+    // ── Devices: agents register here on first launch ────────────────────────
+    match /users/{uid}/devices/{deviceId} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+    }
+
+    // ── User config / preferences ────────────────────────────────────────────
+    match /users/{uid}/config/{doc} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+    }
+
+    // ── Protocol sessions: client logs completed sessions ────────────────────
+    match /users/{uid}/protocol_sessions/{id} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+    }
+
+    // ── Weekly reports: Cloud Function only, client read-only ────────────────
+    match /users/{uid}/weeklyReports/{weekId} {
+      allow read:  if request.auth != null && request.auth.uid == uid;
+      allow write: if false; // only Admin SDK (weeklyRollup Cloud Function)
+    }
+
+    // ── DERIVED: Cloud Function output — client READ-ONLY ───────────────────
+    // MEDIUM-1 FIX: The previous wildcard /users/{uid}/{document=**} allowed
+    // clients to overwrite derived/{date}, which is written exclusively by the
+    // mergeAgentData Cloud Function (Admin SDK). A buggy or malicious client
+    // could corrupt the entire dashboard by writing garbage here.
+    match /users/{uid}/derived/{date} {
+      allow read:  if request.auth != null && request.auth.uid == uid;
+      allow write: if false; // only Admin SDK (mergeAgentData / weeklyRollup)
+    }
+
+    // ── Protocols: any authenticated user reads, no client writes ────────────
     match /protocols/{protocolId} {
       allow read:  if request.auth != null;
-      allow write: if false;
+      allow write: if false; // only Admin SDK (seedProtocols function)
     }
   }
 }

@@ -3,6 +3,8 @@ import {
   createUserWithEmailAndPassword,
   signOut as fbSignOut,
   onAuthStateChanged,
+  GoogleAuthProvider,
+  signInWithPopup,
   type User,
 } from 'firebase/auth';
 import { auth } from './firebase';
@@ -21,6 +23,16 @@ export interface AuthState {
  */
 export async function signIn(email: string, password: string): Promise<User> {
   const cred = await signInWithEmailAndPassword(auth, email, password);
+  return cred.user;
+}
+
+/**
+ * Sign in with Google (OAuth).
+ * This aligns with the mobile application's authentication method.
+ */
+export async function signInWithGoogle(): Promise<User> {
+  const provider = new GoogleAuthProvider();
+  const cred = await signInWithPopup(auth, provider);
   return cred.user;
 }
 

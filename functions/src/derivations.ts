@@ -78,7 +78,11 @@ export function computeDerivedDayMetrics(
   const desktopVelocityPeak = desktops.length > 0
     ? Math.max(...desktops.map(d => d.switchVelocityPeak))
     : 0;
+  // switchVelocityPeak from both agents is in switches/MIN (count in 5-min window ÷ 5).
+  // Store the raw value for the session fields, but convert to switches/HR for
+  // threshold comparisons — UserConfig.switch_critical_threshold is switches/hr.
   const combinedSwitchVelocityPeak = Math.max(phoneVelocityPeak, desktopVelocityPeak);
+  const combinedVelocityPeakPerHour = combinedSwitchVelocityPeak * 60;
 
   // Hourly switch velocity: sum phone + desktop per hour, normalised to switches/hr
   // phoneHourly and desktopHourly are 0–100 load% — convert to est. switches/hr
@@ -138,9 +142,11 @@ export function computeDerivedDayMetrics(
   }));
   const breachCount = breaches.filter(b => b.is_breach).length;
 
+  // CRITICAL-2 FIX: compare in switches/hr — combinedVelocityPeakPerHour is
+  // already converted above. critThreshold and baseline are switches/hr per UserConfig.
   const volatility =
-    combinedSwitchVelocityPeak > critThreshold ? 'HIGH_VOLATILITY'
-    : combinedSwitchVelocityPeak > baseline * 1.5 ? 'ELEVATED'
+    combinedVelocityPeakPerHour > critThreshold ? 'HIGH_VOLATILITY'
+    : combinedVelocityPeakPerHour > baseline * 1.5 ? 'ELEVATED'
     : 'NORMAL';
 
   // ── Screen Time ────────────────────────────────────────────────────────────
@@ -199,7 +205,12 @@ export function computeDerivedDayMetrics(
     : 'NORMAL';
 
   // Neural noise index: velocity peak normalised to 0–20 (Hz-like scale for UI)
-  const neuralNoise = Math.round((combinedSwitchVelocityPeak / 100) * 20 * 10) / 10;
+  // CRITICAL-2 FIX: neuralNoise is a 0–20 HUD scale (Hz-like).
+  // Normalise against 1.5× critThreshold (switches/hr) so 20 = "maximum neural disruption".
+  // Using the /hr value so the scale is meaningful (not always near 0).
+  const neuralNoise = Math.round(
+    clamp(combinedVelocityPeakPerHour / (critThreshold * 1.5), 0, 1) * 20 * 10
+  ) / 10;
 
   // ── Focus Blocks ───────────────────────────────────────────────────────────
   // Phone productive fraction + desktop focusedTime
