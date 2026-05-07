@@ -18,8 +18,6 @@ export interface AuthState {
 /**
  * Sign in with email + password.
  * Returns the Firebase User with a stable UID that persists across devices.
- * NOTE: anonymous auth was removed — it produces unstable UIDs that orphan
- * historical data when the user reinstalls or clears app storage.
  */
 export async function signIn(email: string, password: string): Promise<User> {
   const cred = await signInWithEmailAndPassword(auth, email, password);
@@ -27,45 +25,19 @@ export async function signIn(email: string, password: string): Promise<User> {
 }
 
 /**
- * Sign in with Google (OAuth) — WEB / MOBILE ONLY.
+ * Sign in with Google OAuth via signInWithPopup.
  *
- * BUG-3 FIX: The original had no environment guard. If any code path on
- * desktop accidentally imported and called this function, it would fail with
- * a cryptic error deep inside the Firebase SDK because:
+ * Works in all environments:
+ *   - Web:      standard browser popup
+ *   - Mobile:   Firebase Flutter SDK handles this separately (not this fn)
+ *   - Electron: works because index.ts registers setWindowOpenHandler that
+ *               allows Firebase/Google auth URLs, so Electron opens a child
+ *               BrowserWindow (500×620) for the Google consent screen instead
+ *               of blocking the popup.
  *
- *   1. signInWithPopup() tries to open a browser popup window.
- *   2. Electron’s sandboxed renderer blocks popups (no window.open access).
- *   3. Even if the popup opened, the OAuth redirect would land in a new
- *      Electron window with no way to exchange the auth code — the flow
- *      hangs indefinitely.
- *
- * Desktop uses a completely different flow (system browser + deep-link):
- *   renderer → window.electronAPI.triggerGoogleSignIn()
- *            → ipcRenderer.invoke('auth:triggerGoogle')
- *            → main: shell.openExternal(Google OAuth URL)
- *            → deep-link: cognitrack://auth?code=...
- *            → main: googleOAuth.ts → signInWithCredential()
- *
- * This guard throws immediately with a clear message if called from
- * Electron’s renderer process, so the mistake surfaces at dev time
- * rather than silently hanging in production.
+ * Caller handles auth/popup-closed-by-user gracefully (not an error).
  */
 export async function signInWithGoogle(): Promise<User> {
-  // Detect Electron renderer: `process` is defined in the preload context
-  // and `window.electronAPI` is exposed by the preload bridge.
-  const isElectronRenderer =
-    typeof window !== 'undefined' &&
-    typeof (window as any).electronAPI !== 'undefined';
-
-  if (isElectronRenderer) {
-    throw new Error(
-      '[api-client] signInWithGoogle() cannot be called from Electron.\n' +
-      'Use window.electronAPI.triggerGoogleSignIn() instead, which opens\n' +
-      'the system browser and handles the OAuth deep-link callback in main.'
-    );
-  }
-
-  // Web / mobile: standard popup flow is fine.
   const provider = new GoogleAuthProvider();
   const cred = await signInWithPopup(auth, provider);
   return cred.user;
