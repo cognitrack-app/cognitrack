@@ -5,13 +5,13 @@ appId: com.cognitrack.desktop
 productName: CogniTrack
 copyright: Copyright © 2026 CogniTrack
 
-# ── Directories ─────────────────────────────────────────────────────────
+# ── Directories ────────────────────────────────────────────────────
 
 directories:
   output: dist
   buildResources: build
 
-# ── Files included in the package ──────────────────────────────────────
+# ── Files included in the package ─────────────────────────────────
 
 files:
   - dist-electron/**
@@ -26,13 +26,30 @@ extraResources:
       - '**/*.png'
       - '**/*.ico'
 
-# ── Windows targets ──────────────────────────────────────────────────
+# ── Custom URI scheme (deep-link for Google OAuth callback) ─────────────
+#
+# Registers cognitrack:// in the Windows registry (HKCR\cognitrack) during
+# NSIS install so the OS can route cognitrack://auth?code=... back to the app.
+# On macOS this is declared in Info.plist CFBundleURLTypes automatically.
+#
+# After install, verify with:
+#   reg query HKCR\cognitrack  (Windows)
+#   /usr/bin/plutil -p CogniTrack.app/Contents/Info.plist | grep -A5 URL  (macOS)
+
+protocols:
+  - name: CogniTrack Auth
+    schemes:
+      - cognitrack
+
+# ── Windows targets ─────────────────────────────────────────────
 
 win:
   # Icon must be a 256x256+ .ico file
   icon: build/icon.ico
-  # asInvoker = no UAC elevation prompt on launch
-  # This is intentional — CogniTrack never needs admin rights
+  # asInvoker = no UAC elevation prompt on launch.
+  # CogniTrack never needs admin rights for tracking.
+  # Protocol registration is written to HKCU (per-user) by electron-builder,
+  # which does NOT require elevation.
   requestedExecutionLevel: asInvoker
   target:
     - target: nsis        # Full installer with uninstaller
@@ -40,19 +57,21 @@ win:
     - target: portable    # Single .exe, no install needed
       arch: [x64]
 
-# ── NSIS installer options ────────────────────────────────────────────
+# ── NSIS installer options ─────────────────────────────────────
 
 nsis:
   oneClick: false                          # Show installer UI
   allowToChangeInstallationDirectory: true
+  # allowElevation must stay false when requestedExecutionLevel is asInvoker.
+  # Protocol registration uses HKCU (per-user) — no admin needed.
+  allowElevation: false
   createDesktopShortcut: true
   createStartMenuShortcut: true
   shortcutName: CogniTrack
   runAfterFinish: true                     # Launch app after install
-  # Install per-user by default (no admin required)
-  perMachine: false
+  perMachine: false                        # Per-user install (no admin required)
 
-# ── Native modules (better-sqlite3 / active-win need rebuilding) ───────
+# ── Native modules (better-sqlite3 / active-win need rebuilding) ────────
 
 asar: true
 asarUnpack:
@@ -61,11 +80,11 @@ asarUnpack:
   - '**/node_modules/better-sqlite3/**'
   - '**/node_modules/active-win/**'
 
-# ── Rebuild native modules against Electron's Node version ────────────
+# ── Rebuild native modules against Electron’s Node version ────────────
 
 beforePackHook: node scripts/rebuild-natives.js
 
-# ── Auto-updater (future) ────────────────────────────────────────────
+# ── Auto-updater (future) ─────────────────────────────────────
 
 # publish:
 #   provider: github
