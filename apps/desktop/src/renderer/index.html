@@ -5,7 +5,42 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>CogniTrack</title>
     <meta name="description" content="CogniTrack — Cognitive Load Monitor" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self' https://*.googleapis.com https://*.firebaseio.com; img-src 'self' data:;">
+
+    <!--
+      Content Security Policy
+      =======================
+      Hardened CSP for the Electron tray popover renderer.
+
+      Changes from original:
+        connect-src — added:
+          • https://accounts.google.com          (Google OAuth token endpoint)
+          • https://securetoken.googleapis.com  (Firebase ID-token refresh)
+          • wss://*.firebaseio.com               (Firestore realtime WebSocket)
+        img-src     — added https: to allow Google profile photos (future use)
+        form-action — set to 'none' (popover has no HTML form submissions)
+
+      Note: Google OAuth sign-in itself opens in the SYSTEM BROWSER via
+      shell.openExternal() in the main process — NOT in this renderer.
+      The renderer only needs to reach Firebase APIs for auth-state checks
+      and the token exchange is done entirely in the main process.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="
+        default-src   'self';
+        script-src    'self';
+        style-src     'self' 'unsafe-inline';
+        font-src      'self';
+        connect-src   'self'
+                      https://*.googleapis.com
+                      https://*.firebaseio.com
+                      https://accounts.google.com
+                      https://securetoken.googleapis.com
+                      wss://*.firebaseio.com;
+        img-src       'self'  https:;
+        form-action   'none';
+      "
+    />
   </head>
   <body>
     <div id="root"></div>
