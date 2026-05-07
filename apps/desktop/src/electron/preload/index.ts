@@ -10,14 +10,14 @@ import { contextBridge, ipcRenderer } from 'electron';
  *    IPC channels.
  *
  * Channels exposed:
- *  ─ Stats / tracking ────────────────────────────────────
+ *  — Stats / tracking ——————————————————————————————
  *  tray:getStats       → invoke → TrayStats
  *  tracker:pause       → invoke → { isTracking: false }
  *  tracker:resume      → invoke → { isTracking: true }
  *  tray:statsUpdate    → on     → TrayStats (pushed from main after each batch)
  *
- *  ─ Auth ───────────────────────────────────────────
- *  auth:signedIn       → send  → void  (renderer signals sign-in to main)
+ *  — Auth ——————————————————————————————————————————
+ *  auth:signedIn       → send   → void  (renderer signals sign-in to main)
  *  auth:triggerGoogle  → invoke → Promise<string> uid  (starts OAuth flow)
  */
 
@@ -36,46 +36,44 @@ export interface TrayStats {
 }
 
 export interface ElectronAPI {
-  // ─ Stats / tracking ──────────────────────────────────────
-  getStats:       () => Promise<TrayStats>;
-  pauseTracking:  () => Promise<{ isTracking: boolean }>;
-  resumeTracking: () => Promise<{ isTracking: boolean }>;
-  onStatsUpdate:  (cb: (stats: TrayStats) => void) => () => void;
-
-  // ─ Auth: email/password (existing) ────────────────────────
-  /** Signals to the main process that the user has signed in. */
-  signIn: (uid: string) => void;
-
-  // ─ Auth: Google OAuth via system browser ────────────────────
-  /**
-   * Triggers Google OAuth via the system browser (shell.openExternal).
-   * Returns a Promise that resolves with the Firebase UID once the user
-   * completes sign-in and the deep-link callback is processed by main.
-   * Rejects with an Error if the user cancels or if a timeout occurs.
-   */
+  getStats:            () => Promise<TrayStats>;
+  pauseTracking:       () => Promise<{ isTracking: boolean }>;
+  resumeTracking:      () => Promise<{ isTracking: boolean }>;
+  onStatsUpdate:       (cb: (stats: TrayStats) => void) => () => void;
+  signIn:              (uid: string) => void;
   triggerGoogleSignIn: () => Promise<string>;
 }
 
 contextBridge.exposeInMainWorld('electronAPI', {
-  // ─ Stats / tracking ──────────────────────────────────────
+
   getStats:       () => ipcRenderer.invoke('tray:getStats'),
   pauseTracking:  () => ipcRenderer.invoke('tracker:pause'),
   resumeTracking: () => ipcRenderer.invoke('tracker:resume'),
 
-  // Real-time stats pushed from main after each batch
-  onStatsUpdate: (cb: (stats: TrayStats) => void) => {
-    const handler = (_event: Electron.IpcRendererEvent,  TrayStats) => cb(data);
+  /**
+   * BUG-1 FIX — onStatsUpdate live push handler.
+   *
+   * ORIGINAL (broken):
+   *   const handler = (_event, TrayStats) => cb(data);
+   *   Problem 1: `TrayStats` was used as the parameter NAME, shadowing the
+   *              interface declaration and giving the param a useless type.
+   *   Problem 2: `data` was referenced inside the arrow body but was NEVER
+   *              declared in scope — this is a ReferenceError at runtime.
+   *   Result:    The ipcRenderer listener registered successfully but threw
+   *              on every invocation. Live stats updates from main (pushed
+   *              after each hourly batch) silently crashed and NEVER reached
+   *              the renderer. Only the 30-second polling fallback worked.
+   *
+   * FIX: rename parameter to ` TrayStats` — typed correctly, in scope.
+   */
+  onStatsUpdate: (cb: (stats: TrayStats) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent,  TrayStats): void => cb(data);
     ipcRenderer.on('tray:statsUpdate', handler);
-    // Return cleanup function so React useEffect can unsubscribe on unmount
     return () => ipcRenderer.removeListener('tray:statsUpdate', handler);
   },
 
-  // ─ Auth ─────────────────────────────────────────────────
-  // Email/password: renderer signals main that sign-in is complete
   signIn: (uid: string) => ipcRenderer.send('auth:signedIn', uid),
 
-  // Google OAuth: invoke triggers the system-browser flow in main process.
-  // The Promise resolves with the Firebase UID after the deep-link callback.
   triggerGoogleSignIn: () => ipcRenderer.invoke('auth:triggerGoogle'),
 
 } satisfies ElectronAPI);

@@ -1,6 +1,9 @@
 import React, { useState } from 'react';
 import { signInWithEmailAndPassword } from 'firebase/auth';
-import { auth } from '../../../../packages/api-client/src/firebase';
+// BUG-2 FIX (same as App.tsx): was a raw relative cross-package path which
+// breaks in production builds where packages/ is not at ../../../../.
+// Using the workspace package name resolves correctly at dev + build time.
+import { auth } from '@cognitrack/api-client';
 
 /**
  * SignInPopover — shown when the user is not authenticated.
