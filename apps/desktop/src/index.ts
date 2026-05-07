@@ -1,7 +1,8 @@
 // Load environment variables BEFORE any Firebase-dependent imports
 import 'dotenv/config';
+import fs from 'fs';
 import path from 'path';
-import { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain } from 'electron';
+import { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, shell } from 'electron';
 import { registerIpcHandlers } from './electron/main/ipcHandlers';
 import { SQLiteStore } from './electron/main/sqliteStore';
 import { ActiveWindowTracker } from './electron/main/activeWindowTracker';
@@ -9,10 +10,10 @@ import { waitForAuth, getTodayDateString } from './electron/main/utils';
 import { getDeviceId } from './electron/main/deviceId';
 import { processBatch } from './electron/main/batchProcessor';
 import { SyncEngine } from '@cognitrack/sync-engine';
-import { registerDevice } from '@cognitrack/api-client';
-import { registerGoogleOAuthHandler, handleOAuthCallback } from './electron/main/googleOAuth';
+import { registerDevice, onAuthChange } from '@cognitrack/api-client';
+import { ensureAccessibilityPermission } from './electron/main/macPermissions';
 
-// ── Module-level singletons (set once in whenReady) ─────────────────────────
+// ── Module-level singletons (set once in whenReady) ─────────────────────────────
 
 let store:      SQLiteStore;
 let syncEngine: SyncEngine;
@@ -22,232 +23,269 @@ let tray:       Tray | null = null;
 let userId:     string;
 let deviceId:   string;
 
-// ── Single-instance lock + Windows deep-link (cognitrack://) ──────────────────
+// ── Single-instance lock ───────────────────────────────────────────────────────────
 //
-// On Windows, when the OS handles a cognitrack:// URI the registered handler
-// launches a NEW instance of the app with the URI as the last argv argument.
-// We use requestSingleInstanceLock() so the second instance immediately quits
-// and the FIRST (already-running) instance receives the URI via second-instance.
-//
-// This MUST be called before app.whenReady().
+// Multiple instances fight for the SQLite WAL lock and corrupt the database.
+// requestSingleInstanceLock() must be called BEFORE app.whenReady().
 
-const gotSingleInstanceLock = app.requestSingleInstanceLock();
-
-if (!gotSingleInstanceLock) {
-  // We are the second instance — quit immediately.
-  // The first instance handles everything via the second-instance event below.
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  console.error('[startup] Another instance is already running. Exiting.');
   app.quit();
-} else {
-  // First (real) instance: listen for subsequent launch attempts.
-  app.on('second-instance', (_event, argv) => {
-    // On Windows, deep-link URL is injected as the last argv element.
-    // e.g. argv = ['...electron.exe', '--', 'cognitrack://auth?code=abc123']
-    const deepLinkUrl = argv.find(arg => arg.startsWith('cognitrack://'));
-    if (deepLinkUrl) {
-      console.log('[deeplink] second-instance received URL:', deepLinkUrl);
-      handleOAuthCallback(deepLinkUrl).catch(err =>
-        console.error('[deeplink] handleOAuthCallback error:', err)
-      );
-    }
-    // Bring the popover window to front so the user sees the result.
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.show();
-      mainWindow.focus();
-    }
-  });
 }
 
-// ── macOS deep-link handler (open-url event, same instance) ─────────────────
-//
-// On macOS the OS calls open-url on the SAME running instance — no second
-// instance is spawned. Also register cognitrack:// via setAsDefaultProtocolClient
-// here; on Windows this is handled by electron-builder's `protocols` key in
-// electron-builder.yml which writes the registry during install. We call it
-// here anyway as a fallback for unsigned/dev builds.
-
-app.on('open-url', (_event, url) => {
-  console.log('[deeplink] open-url received:', url);
-  handleOAuthCallback(url).catch(err =>
-    console.error('[deeplink] handleOAuthCallback error:', err)
-  );
-});
-
-// Register as default handler for cognitrack:// scheme.
-// On Windows this sets HKCU\Software\Classes\cognitrack in the registry.
-// electron-builder's protocols config does this for installed builds;
-// this call ensures it also works in dev/unpackaged mode on both platforms.
-if (!app.isDefaultProtocolClient('cognitrack')) {
-  app.setAsDefaultProtocolClient('cognitrack');
-}
-
-// ── App lifecycle ───────────────────────────────────────────────────────
+// ── App lifecycle ──────────────────────────────────────────────────────────────────
 
 app.whenReady().then(async () => {
-  // 1. Auto-launch on login (registry on Windows, LaunchAgents on macOS)
+
+  // 1. Auto-launch on login
+  // FIX: openAsHidden is macOS-only. On Windows, pass --hidden as a launch arg
+  // and guard it in step 14. electron-builder's auto-launcher handles this arg.
   app.setLoginItemSettings({
-    openAtLogin:  true,
-    openAsHidden: true,   // start silently in tray, no window
-    name:         'CogniTrack',
+    openAtLogin: true,
+    args:        ['--hidden'],
+    name:        'CogniTrack',
   });
 
-  // 2. SQLite — must be first, tracker writes events immediately
+  // 1b. macOS: hide Dock icon — CogniTrack is a tray-only agent.
+  // app.dock is undefined on Windows so the optional chain is safe.
+  if (process.platform === 'darwin') {
+    app.dock?.hide();
+  }
+
+  // 2. SQLite — must be first; tracker writes events immediately
   store = new SQLiteStore();
 
-  // 3. Sync queue db in the same userData directory
-  const queueDbPath = path.join(app.getPath('userData'), 'db', 'sync-queue.db');
+  // 3. Sync queue db in the same userData directory.
+  // FIX: Ensure the 'db' subdirectory exists before SyncEngine tries to open
+  // its file inside it. Without this, SyncEngine crashes on fresh installs
+  // because SQLiteStore only creates cognitrack.db's directory, not the parent.
+  const dbDir = path.join(app.getPath('userData'), 'db');
+  fs.mkdirSync(dbDir, { recursive: true });
+  const queueDbPath = path.join(dbDir, 'sync-queue.db');
   syncEngine = new SyncEngine(queueDbPath);
 
-  // 4. Active window tracker (no start yet — needs auth first)
+  // 4. Active window tracker (no start yet — needs auth + permission first)
   tracker = new ActiveWindowTracker(store);
 
   // 5. Tray popover window (hidden by default)
-  //    Height is 320 to accommodate the sign-in form (Google button +
-  //    email/password) without clipping. The TrayPopover (post-auth) is
-  //    smaller but the window does not resize — CSS handles the layout.
+  //    280px: fits TrayPopover (stats + mobile section + footer) without scrollbar.
+  //    320px was needed for the sign-in form; TrayPopover is shorter.
   mainWindow = createPopoverWindow();
 
-  // 6. Register Google OAuth IPC handler BEFORE renderer loads,
-  //    so the 'auth:triggerGoogle' invoke is ready when the sign-in form appears.
-  registerGoogleOAuthHandler(mainWindow);
-
-  // 7. System tray
+  // 6. System tray
   tray = createTray();
 
-  // 8. IPC handlers — tracker + syncEngine for tray controls
-  registerIpcHandlers(store, tracker, syncEngine);
+  // 7. IPC handlers
+  // FIX: pass refreshTray callback so pause/resume handlers can update the
+  // tray context menu label immediately (without waiting for the next batch).
+  // FIX: pass getUserId getter so sync:pullMobileData reads the post-auth UID
+  // (registerIpcHandlers is called before sign-in completes).
+  registerIpcHandlers(
+    store,
+    tracker,
+    syncEngine,
+    () => tray?.setContextMenu(buildTrayMenu()),
+    () => userId,
+  );
 
-  // 9. Load the renderer so it can display the sign-in form if needed
+  // 8. Load the renderer
   if (app.isPackaged) {
     mainWindow.loadFile(path.join(__dirname, '../dist-renderer/index.html'));
   } else {
-    // Dev: Vite dev server
     mainWindow.loadURL('http://localhost:5173');
   }
 
+  // 9. Keep userId in sync for any post-auth token refreshes
+  onAuthChange(user => {
+    if (user) userId = user.uid;
+  });
+
   // 10. Wait for Firebase auth before doing anything network-related.
-  //     waitForAuth() checks the persisted Firebase auth state immediately;
-  //     if the user is already signed in (token cached) it resolves in < 1 s.
-  //     If not, we show the popover and wait for the renderer to signal sign-in.
+  //     waitForAuth() resolves immediately if a cached token exists (< 1 s).
+  //     If not, show the popover and wait for the renderer to signal sign-in.
   try {
     userId = await waitForAuth();
   } catch (err) {
-    // Not signed in yet — show the popover so user sees the sign-in form.
     console.warn('[startup] Not authenticated, showing popover:', err);
     showPopover();
-    // Wait for sign-in signal from renderer (either email/password or Google OAuth).
-    userId = await waitForAuthFromRenderer();
+
+    // FIX: Retry loop — waitForAuthFromRenderer() uses ipcMain.on (not .once)
+    // so renderer reloads can re-signal. On failure, reload the renderer and
+    // wait again instead of crashing or hanging.
+    let authSuccess = false;
+    while (!authSuccess) {
+      try {
+        userId = await waitForAuthFromRenderer();
+        authSuccess = true;
+      } catch (authErr) {
+        console.error('[startup] Auth from renderer failed, reloading:', authErr);
+        mainWindow?.reload();
+      }
+    }
   }
 
   // 11. Register/update this device in Firestore
   deviceId = getDeviceId();
-  await registerDevice(userId, deviceId, process.platform as any, 'CogniTrack Desktop', app.getVersion())
-    .catch(err => console.warn('[startup] Device registration failed (non-fatal):', err));
+  await registerDevice(
+    userId, deviceId, process.platform as 'win32' | 'darwin', 'CogniTrack Desktop', app.getVersion(),
+  ).catch(err => console.warn('[startup] Device registration failed (non-fatal):', err));
 
   // 12. Mark sync engine online and flush any queued items
   syncEngine.setOnline(true);
 
-  // 13. Start the active window tracker
-  tracker.start();
-
-  // DESK-06 FIX: Refresh tray menu now that tracker is running — buildTrayMenu()
-  // was called during createTray() at step 7, before tracker.start(), so the
-  // initial menu incorrectly showed "○ Tracking Paused" on every cold launch.
-  tray?.setContextMenu(buildTrayMenu());
+  // 13. Check macOS Accessibility permission before starting tracker.
+  //     active-win requires this to read the frontmost app name.
+  //     Returns true immediately on Windows/Linux (permission not needed).
+  //     If denied on macOS, shows a branded dialog and returns false.
+  const hasPermission = await ensureAccessibilityPermission();
+  if (hasPermission) {
+    tracker.start();
+    // Refresh tray menu now that tracker is running — buildTrayMenu() was
+    // called during createTray() before tracker.start(), so the initial label
+    // incorrectly showed "○ Tracking Paused" on every cold launch.
+    tray?.setContextMenu(buildTrayMenu());
+  } else {
+    console.warn('[startup] Accessibility permission not granted — tracker not started');
+  }
 
   // 14. Hourly batch: compute cognitive metrics and sync to Firestore
   scheduleHourlyBatch();
 
+  // 15. If launched with --hidden (OS startup item), ensure popover stays closed
+  if (process.argv.includes('--hidden')) {
+    mainWindow?.hide();
+  }
+
   console.log(`[startup] CogniTrack ready — userId=${userId} deviceId=${deviceId}`);
 });
 
-// Flush final batch and clean up before quitting
-app.on('before-quit', async () => {
-  console.log('[shutdown] Running final batch before quit...');
-  if (store && syncEngine && userId && deviceId) {
-    await processBatch(store, syncEngine, userId, deviceId, mainWindow).catch(console.error);
-  }
-  tracker?.stop();
-  store?.close();
-});
+// ── Shutdown ─────────────────────────────────────────────────────────────────────────────
 
-// Prevent full quit when all windows are closed (keep running in tray)
-app.on('window-all-closed', (e: Event) => {
+// Flush final batch and clean up before quitting.
+//
+// FIX: Electron does NOT await async before-quit handlers — the process would
+// exit immediately after the handler function returns, before any awaited work
+// runs. The final batch (the most important one) was silently skipped on every
+// quit. Fix: e.preventDefault() blocks the OS quit, we run cleanup in an IIFE,
+// then call app.exit(0) which bypasses before-quit to avoid re-emission.
+app.on('before-quit', (e) => {
   e.preventDefault();
+  (async () => {
+    console.log('[shutdown] Running final batch before quit…');
+    if (store && syncEngine && userId && deviceId) {
+      await processBatch(store, syncEngine, userId, deviceId, mainWindow, tracker).catch(console.error);
+    }
+    tracker?.stop();
+    store?.close();
+    app.exit(0); // bypasses before-quit to avoid recursion
+  })();
 });
 
-// ── Popover window factory ──────────────────────────────────────────────────
+// Keep running in tray when all windows are closed
+app.on('window-all-closed', () => {
+  // Do nothing — prevents Electron's default app.quit() on window close
+});
+
+// ── Popover window factory ───────────────────────────────────────────────────────────
 
 function createPopoverWindow(): BrowserWindow {
   const win = new BrowserWindow({
-    width:   260,
-    // 320px: tall enough for the sign-in form (Google btn + divider +
-    // email/password + error msg) without scrollbar. TrayPopover (post-auth)
-    // fits comfortably in this height too.
-    height:  320,
-    frame:          false,      // no OS chrome — custom titlebar via CSS
+    width:          260,
+    height:         280,
+    frame:          false,
     resizable:      false,
-    skipTaskbar:    true,       // don’t appear in taskbar / dock
-    alwaysOnTop:    true,       // floats above everything
-    show:           false,      // hidden until tray click
-    transparent:    true,       // enables rounded corners via CSS
+    skipTaskbar:    true,
+    alwaysOnTop:    true,
+    show:           false,
+    transparent:    true,
     hasShadow:      true,
     webPreferences: {
       preload:          path.join(__dirname, 'electron/preload/index.js'),
       contextIsolation: true,
       nodeIntegration:  false,
-      // Disable remote module (deprecated, security best practice)
-      sandbox:          false,  // sandbox:true breaks CommonJS preload on Electron 30
+      sandbox:          false, // sandbox:true breaks CommonJS preload on Electron 30
     },
   });
 
-  // Hide when losing focus (click-away dismissal).
-  // Exception: while the system browser is open for Google OAuth, we do NOT
-  // want the popover to hide — but since the window is already hidden at that
-  // point (user clicked the button which closes the popover first), this is fine.
-  win.on('blur', () => {
-    win.hide();
-  });
+  // Click-away dismissal
+  win.on('blur', () => win.hide());
 
-  // Never truly close — just hide to tray
+  // Never truly close — just hide
   win.on('close', (e) => {
     e.preventDefault();
     win.hide();
   });
 
+  // FIX: Allow Firebase signInWithPopup to open a popup window.
+  // Electron v30+ denies all window.open() calls by default (no handler = deny).
+  // Firebase Auth SDK uses window.open() to launch the Google OAuth consent page.
+  // Without this handler the popup is silently blocked and Google sign-in hangs.
+  // Allow only Firebase/Google auth URLs; all other links go to system browser.
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    const isAuthUrl =
+      url.startsWith('https://accounts.google.com') ||
+      url.includes('.firebaseapp.com/__/auth')     ||
+      url.startsWith('https://apis.google.com');
+
+    if (isAuthUrl) {
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          width:       500,
+          height:      620,
+          resizable:   false,
+          alwaysOnTop: true,
+        },
+      };
+    }
+
+    shell.openExternal(url).catch(console.error);
+    return { action: 'deny' };
+  });
+
   return win;
 }
 
-// ── Show popover anchored above tray icon ────────────────────────────────────
+// ── Show popover anchored to tray icon ─────────────────────────────────────────────
 
 function showPopover(): void {
   if (!mainWindow || !tray) return;
 
-  const trayBounds   = tray.getBounds();
-  const windowBounds = mainWindow.getBounds();
+  const trayBounds = tray.getBounds();
+  const winBounds  = mainWindow.getBounds();
 
-  // Position centered above the tray icon
-  const x = Math.round(trayBounds.x + trayBounds.width  / 2 - windowBounds.width  / 2);
-  const y = Math.round(trayBounds.y - windowBounds.height - 4);
+  const x = Math.round(trayBounds.x + trayBounds.width / 2 - winBounds.width / 2);
+
+  // FIX: macOS menu bar is at the TOP of the screen — the popover must open
+  // BELOW the tray icon. The original code always placed it ABOVE, which put
+  // the window off-screen on macOS. Windows taskbar is at the BOTTOM —
+  // popover goes ABOVE.
+  const y = process.platform === 'darwin'
+    ? Math.round(trayBounds.y + trayBounds.height + 4)   // macOS: below icon
+    : Math.round(trayBounds.y - winBounds.height  - 4);  // Windows: above icon
 
   mainWindow.setPosition(x, y);
   mainWindow.show();
   mainWindow.focus();
 }
 
-// ── System tray ────────────────────────────────────────────────────────────
+// ── System tray ───────────────────────────────────────────────────────────────────────
 
 function createTray(): Tray {
-  const iconPath = app.isPackaged
-    ? path.join(process.resourcesPath, 'assets', 'tray-icon.png')
-    : path.join(__dirname, '../assets/tray-icon.png');
+  // macOS menu bar icons must be named *Template.png so Electron auto-inverts
+  // them for dark/light mode. Windows uses the full-colour PNG.
+  const isMac     = process.platform === 'darwin';
+  const iconName  = isMac ? 'tray-iconTemplate.png' : 'tray-icon.png';
+  const iconPath  = app.isPackaged
+    ? path.join(process.resourcesPath, 'assets', iconName)
+    : path.join(__dirname, '../assets', iconName);
 
   const icon = nativeImage.createFromPath(iconPath);
   const t    = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon);
 
   t.setToolTip('CogniTrack — Cognitive Load Tracker');
 
-  // Left-click: show/hide the popover
   t.on('click', () => {
     if (mainWindow?.isVisible()) {
       mainWindow.hide();
@@ -256,9 +294,7 @@ function createTray(): Tray {
     }
   });
 
-  // Right-click: context menu
   t.setContextMenu(buildTrayMenu());
-
   return t;
 }
 
@@ -267,7 +303,7 @@ function buildTrayMenu(): Menu {
   return Menu.buildFromTemplate([
     {
       label:   isTracking ? '● Tracking Active' : '○ Tracking Paused',
-      enabled: false, // informational only
+      enabled: false,
     },
     { type: 'separator' },
     {
@@ -278,7 +314,7 @@ function buildTrayMenu(): Menu {
         } else {
           tracker?.start();
         }
-        tray?.setContextMenu(buildTrayMenu()); // refresh label
+        tray?.setContextMenu(buildTrayMenu());
       },
     },
     { type: 'separator' },
@@ -293,49 +329,53 @@ function buildTrayMenu(): Menu {
   ]);
 }
 
-// ── Hourly batch scheduler ───────────────────────────────────────────────────
+// ── Hourly batch scheduler ─────────────────────────────────────────────────────────────
 
 function scheduleHourlyBatch(): void {
   const ONE_HOUR = 60 * 60 * 1000;
 
-  // Run once immediately so today’s partial data is available fast
-  processBatch(store, syncEngine, userId, deviceId, mainWindow).catch(console.error);
+  // Run immediately so today's partial data is available on startup
+  processBatch(store, syncEngine, userId, deviceId, mainWindow, tracker).catch(console.error);
 
-  // Then schedule every hour with +-5 min jitter to avoid thundering-herd
+  // Then every hour with ±5-min jitter to avoid thundering-herd on shared Firestore
   const jitter = Math.floor(Math.random() * 5 * 60 * 1000);
   setInterval(() => {
-    processBatch(store, syncEngine, userId, deviceId, mainWindow).catch(console.error);
+    processBatch(store, syncEngine, userId, deviceId, mainWindow, tracker).catch(console.error);
     tray?.setContextMenu(buildTrayMenu());
   }, ONE_HOUR + jitter);
 }
 
-// ── Helper: wait for sign-in signal from renderer ────────────────────────────
+// ── Helper: wait for sign-in signal from renderer ──────────────────────────────────────
 
 /**
- * DESK-04 FIX: Returns a Promise that:
- *  - Resolves with the UID when the renderer emits 'auth:signedIn' with a
- *    valid Firebase UID (>= 20 chars).
- *  - Rejects immediately with a descriptive error if the UID is malformed.
- *  - Rejects after 5 minutes if the renderer never fires the event.
+ * Resolves with the Firebase UID when the renderer emits 'auth:signedIn'.
  *
- * Works for BOTH email/password sign-in (renderer calls signIn(uid) directly)
- * AND Google OAuth (googleOAuth.ts calls signInWithCredential in main, then
- * the renderer's onAuthStateChanged fires and calls signIn(uid)).
+ * FIX (CRIT-5): Uses ipcMain.on (not .once) so renderer reloads can re-signal.
+ * With ipcMain.once, if the renderer reloads during sign-in (e.g. after a
+ * failed attempt), the second auth:signedIn message is silently dropped and
+ * startup hangs forever.
+ *
+ * On an invalid UID, logs a warning and keeps listening — the renderer may
+ * reload and send a valid UID. Only resolves/cleans-up on a valid UID.
+ * Rejects after 5 minutes if the event never fires.
  */
 function waitForAuthFromRenderer(): Promise<string> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
-      ipcMain.removeAllListeners('auth:signedIn');
-      reject(new Error('[auth] Timeout: renderer did not emit auth:signedIn within 5 minutes'));
+      ipcMain.removeListener('auth:signedIn', handler);
+      reject(new Error('[auth] Sign-in timeout: renderer did not emit auth:signedIn within 5 minutes'));
     }, 5 * 60 * 1000);
 
-    ipcMain.once('auth:signedIn', (_event, uid: string) => {
-      clearTimeout(timeout);
+    function handler(_event: Electron.IpcMainEvent, uid: string): void {
       if (typeof uid !== 'string' || uid.trim().length < 20) {
-        reject(new Error(`[auth] Invalid UID from renderer: "${uid}"`));
-        return;
+        console.warn(`[auth] Invalid UID from renderer: "${uid}" — waiting for retry`);
+        return; // keep listener alive
       }
+      clearTimeout(timeout);
+      ipcMain.removeListener('auth:signedIn', handler);
       resolve(uid.trim());
-    });
+    }
+
+    ipcMain.on('auth:signedIn', handler);
   });
 }

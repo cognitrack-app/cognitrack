@@ -9,6 +9,10 @@ import { contextBridge, ipcRenderer } from 'electron';
  *  - Every channel name is hardcoded — the renderer cannot invoke arbitrary
  *    IPC channels.
  *
+ * Auth: Google OAuth is handled entirely by Firebase signInWithPopup() in
+ * the renderer, allowed via setWindowOpenHandler in index.ts (no custom
+ * deep-link protocol or separate OAuth IPC channel needed).
+ *
  * Channels exposed:
  *  — Stats / tracking ——————————————————————————————
  *  tray:getStats       → invoke → TrayStats
@@ -17,8 +21,10 @@ import { contextBridge, ipcRenderer } from 'electron';
  *  tray:statsUpdate    → on     → TrayStats (pushed from main after each batch)
  *
  *  — Auth ——————————————————————————————————————————
- *  auth:signedIn       → send   → void  (renderer signals sign-in to main)
- *  auth:triggerGoogle  → invoke → Promise<string> uid  (starts OAuth flow)
+ *  auth:signedIn       → send   → void (renderer signals sign-in complete to main)
+ *
+ *  — Mobile sync —————————————————————————————————
+ *  sync:pullMobileData → invoke → MobileData | null
  */
 
 export interface TrayStats {
@@ -35,13 +41,28 @@ export interface TrayStats {
   };
 }
 
+/**
+ * Shape of the phoneMetrics field from Firestore.
+ * Mirrors PhoneSyncPayload from @cognitrack/shared — typed loosely here
+ * so the preload doesn’t need a direct dependency on the shared package at
+ * runtime (it runs in a sandboxed context with contextIsolation: true).
+ */
+export interface MobileData {
+  cognitiveLoadPct?:    number;
+  totalScreenTimeMin?:  number;
+  appSwitches?:         number;
+  wmCapacityRemaining?: number;
+  lastUpdated?:         string;
+  [key: string]: unknown;
+}
+
 export interface ElectronAPI {
-  getStats:            () => Promise<TrayStats>;
-  pauseTracking:       () => Promise<{ isTracking: boolean }>;
-  resumeTracking:      () => Promise<{ isTracking: boolean }>;
-  onStatsUpdate:       (cb: (stats: TrayStats) => void) => () => void;
-  signIn:              (uid: string) => void;
-  triggerGoogleSignIn: () => Promise<string>;
+  getStats:        () => Promise<TrayStats>;
+  pauseTracking:   () => Promise<{ isTracking: boolean }>;
+  resumeTracking:  () => Promise<{ isTracking: boolean }>;
+  onStatsUpdate:   (cb: (stats: TrayStats) => void) => () => void;
+  signIn:          (uid: string) => void;
+  syncMobileData:  (date?: string) => Promise<MobileData | null>;
 }
 
 contextBridge.exposeInMainWorld('electronAPI', {
@@ -55,16 +76,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
    *
    * ORIGINAL (broken):
    *   const handler = (_event, TrayStats) => cb(data);
-   *   Problem 1: `TrayStats` was used as the parameter NAME, shadowing the
-   *              interface declaration and giving the param a useless type.
-   *   Problem 2: `data` was referenced inside the arrow body but was NEVER
-   *              declared in scope — this is a ReferenceError at runtime.
-   *   Result:    The ipcRenderer listener registered successfully but threw
-   *              on every invocation. Live stats updates from main (pushed
-   *              after each hourly batch) silently crashed and NEVER reached
-   *              the renderer. Only the 30-second polling fallback worked.
+   *   - `TrayStats` used as param name (shadows the type declaration)
+   *   - `data` never declared in scope → ReferenceError on every IPC push
+   *   Result: live tray stats NEVER updated; only 30s poll fallback worked.
    *
-   * FIX: rename parameter to ` TrayStats` — typed correctly, in scope.
+   * FIX: rename to ` TrayStats` — typed correctly and in scope.
    */
   onStatsUpdate: (cb: (stats: TrayStats) => void): (() => void) => {
     const handler = (_event: Electron.IpcRendererEvent,  TrayStats): void => cb(data);
@@ -74,6 +90,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   signIn: (uid: string) => ipcRenderer.send('auth:signedIn', uid),
 
-  triggerGoogleSignIn: () => ipcRenderer.invoke('auth:triggerGoogle'),
+  syncMobileData: (date?: string) => ipcRenderer.invoke('sync:pullMobileData', date),
 
 } satisfies ElectronAPI);

@@ -35,7 +35,7 @@ export interface DailyMetricsRow {
   totalFocusedTime: number;
   switchVelocityPeak: number;
   peakLoadHour: number;
-  hourlyLoad: string; // JSON array
+  hourlyLoad: string;        // JSON array
   categoryBreakdown: string; // JSON object
   synced: 0 | 1;
   updatedAt: number;
@@ -48,7 +48,7 @@ export interface DailyMetricsRow {
  * power-loss safety. All methods are synchronous.
  *
  * Tables:
- *   app_events   — raw tracking events; 7-day TTL enforced by INSERT trigger
+ *   app_events    — raw tracking events; 7-day TTL enforced by INSERT trigger
  *   daily_metrics — computed 11-scalar summaries ready for Firestore sync
  */
 export class SQLiteStore {
@@ -65,7 +65,6 @@ export class SQLiteStore {
     // WAL mode: writes don't block reads; survives hard power loss
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('foreign_keys = ON');
-    // Recommended for performance on desktop
     this.db.pragma('synchronous = NORMAL');
 
     this.init();
@@ -73,7 +72,7 @@ export class SQLiteStore {
 
   private init(): void {
     this.db.exec(`
-      -- ── Raw events (local-only, 7-day TTL) ────────────────────────────────
+      -- ── Raw events (local-only, 7-day TTL) ───────────────────────────────────────
       CREATE TABLE IF NOT EXISTS app_events (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp  INTEGER NOT NULL,
@@ -96,7 +95,7 @@ export class SQLiteStore {
         WHERE timestamp < (NEW.timestamp - 604800000);
       END;
 
-      -- ── Daily metrics (synced to Firestore as 11 scalars) ─────────────────
+      -- ── Daily metrics (synced to Firestore as 11 scalars) ───────────────────
       CREATE TABLE IF NOT EXISTS daily_metrics (
         date                TEXT PRIMARY KEY,  -- YYYY-MM-DD
         cognitiveDebt       REAL NOT NULL DEFAULT 0,
@@ -115,13 +114,8 @@ export class SQLiteStore {
     `);
   }
 
-  // ── Raw Events ─────────────────────────────────────────────────────────────
+  // ── Raw Events ─────────────────────────────────────────────────────────────────────
 
-  /**
-   * Insert a single raw app event.
-   * The TTL trigger fires automatically and deletes events older than 7 days.
-   * This is the method called by ActiveWindowTracker on every app switch.
-   */
   insertEvent(event: RawEventInsert): void {
     this.db.prepare(`
       INSERT INTO app_events (timestamp, appId, category, eventType, durationMs, deviceType)
@@ -131,12 +125,16 @@ export class SQLiteStore {
 
   /**
    * Fetch all raw events for a given date (local midnight → next midnight).
-   * Used by the batch processor to feed into calculateCognitiveDebt().
+   *
+   * TIMEZONE FIX: `new Date('YYYY-MM-DD')` parses as UTC midnight, not local
+   * midnight. In Copenhagen (UTC+2) that = 02:00 local, so setHours(0,0,0,0)
+   * jumps BACK 2 hours, pulling in the previous day's 22:00–00:00 events
+   * into the current day's batch — silently inflating morning load readings.
+   * localMidnight() builds the Date from integer parts, forcing local time.
    */
   getEventsForDate(date: string): AppEvent[] {
-    const start = new Date(date);
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(start);
+    const start = localMidnight(date);
+    const end   = new Date(start);
     end.setDate(end.getDate() + 1);
 
     const rows = this.db.prepare(`
@@ -146,17 +144,16 @@ export class SQLiteStore {
     `).all(start.getTime(), end.getTime()) as RawEventRow[];
 
     return rows.map(r => ({
-      id: String(r.id),
-      timestamp: r.timestamp,
-      appId: r.appId,
-      category: r.category as Category,
+      id:         String(r.id),
+      timestamp:  r.timestamp,
+      appId:      r.appId,
+      category:   r.category   as Category,
       durationMs: r.durationMs,
-      eventType: r.eventType as AppEvent['eventType'],
+      eventType:  r.eventType  as AppEvent['eventType'],
       deviceType: r.deviceType as DeviceType,
     }));
   }
 
-  /** Count of raw switch events today — used for live UI stats. */
   getSwitchCountToday(): number {
     const start = new Date();
     start.setHours(0, 0, 0, 0);
@@ -167,10 +164,6 @@ export class SQLiteStore {
     return row.count;
   }
 
-  /**
-   * Hourly switch counts for today (for the live chart in the renderer).
-   * Returns 24-element array indexed by hour.
-   */
   getHourlySwitchesToday(): number[] {
     const start = new Date();
     start.setHours(0, 0, 0, 0);
@@ -192,12 +185,8 @@ export class SQLiteStore {
     return result;
   }
 
-  // ── Daily Metrics ──────────────────────────────────────────────────────────
+  // ── Daily Metrics ───────────────────────────────────────────────────────────────────
 
-  /**
-   * Upsert the computed daily metrics for a given date.
-   * Called by the batch processor after running calculateCognitiveDebt().
-   */
   upsertDailyMetrics(metrics: Omit<DailyMetricsRow, 'synced' | 'updatedAt'>): void {
     this.db.prepare(`
       INSERT INTO daily_metrics (
@@ -225,30 +214,24 @@ export class SQLiteStore {
     `).run({ ...metrics, updatedAt: Date.now() });
   }
 
-  /** Fetch daily metrics row for a specific date. Null if not yet computed. */
   getDailyMetrics(date: string): DailyMetricsRow | null {
     return (this.db.prepare(
       'SELECT * FROM daily_metrics WHERE date = ?'
     ).get(date) as DailyMetricsRow | undefined) ?? null;
   }
 
-  /** Fetch all unsynced daily metrics (synced = 0). */
   getUnsyncedMetrics(): DailyMetricsRow[] {
     return this.db.prepare(
       `SELECT * FROM daily_metrics WHERE synced = 0 ORDER BY date DESC`
     ).all() as DailyMetricsRow[];
   }
 
-  /** Mark a date's metrics as successfully synced to Firestore. */
   markSynced(date: string): void {
     this.db.prepare(
       `UPDATE daily_metrics SET synced = 1, updatedAt = ? WHERE date = ?`
     ).run(Date.now(), date);
   }
 
-  /**
-   * Fetch last N days of daily metrics for the history chart.
-   */
   getMetricsHistory(days = 7): DailyMetricsRow[] {
     return this.db.prepare(`
       SELECT * FROM daily_metrics
@@ -257,24 +240,21 @@ export class SQLiteStore {
     `).all(days) as DailyMetricsRow[];
   }
 
-  /** Returns parsed daily_metrics for today as a CognitiveSession array for IPC. */
-  getTodaysSessions(userId: string): DailyMetricsRow[] {
+  getTodaysSessions(_userId: string): DailyMetricsRow[] {
     const today = new Date().toISOString().split('T')[0]!;
     const row = this.getDailyMetrics(today);
     return row ? [row] : [];
   }
 
-  /** Returns 24-element hourly load array for a given date, for the chart IPC handler. */
-  getHourlyBreakdown(userId: string, date: string): { hour: number; debt: number }[] {
+  getHourlyBreakdown(_userId: string, date: string): { hour: number; debt: number }[] {
     const row = this.getDailyMetrics(date);
     if (!row) return [];
     const hourly = JSON.parse(row.hourlyLoad) as number[];
     return hourly.map((debt, hour) => ({ hour, debt }));
   }
 
-  /** Returns top apps by durationMs for a given date, derived from app_events. */
-  getMostUsedApps(userId: string, date: string): { appId: string; appName: string; duration: number }[] {
-    const start = new Date(date); start.setHours(0, 0, 0, 0);
+  getMostUsedApps(_userId: string, date: string): { appId: string; appName: string; duration: number }[] {
+    const start = localMidnight(date);
     const end   = new Date(start); end.setDate(end.getDate() + 1);
     const rows = this.db.prepare(`
       SELECT appId, SUM(durationMs) AS totalMs
@@ -287,25 +267,40 @@ export class SQLiteStore {
     return rows.map(r => ({
       appId:    r.appId,
       appName:  r.appId.split('.').slice(1).join('.') || r.appId,
-      duration: Math.round(r.totalMs / 60000), // ms → minutes
+      duration: Math.round(r.totalMs / 60000),
     }));
   }
 
-  /** Returns daily_metrics rows for a date range [from, to] inclusive. */
-  getSessionsInRange(userId: string, from: string, to: string): DailyMetricsRow[] {
+  getSessionsInRange(_userId: string, from: string, to: string): DailyMetricsRow[] {
     return this.db.prepare(
       `SELECT * FROM daily_metrics WHERE date >= ? AND date <= ? ORDER BY date ASC`
     ).all(from, to) as DailyMetricsRow[];
   }
 
-  /** Fetch a single daily_metrics row by date (used as getById in IPC). */
   getById(date: string): DailyMetricsRow | null {
     return this.getDailyMetrics(date);
   }
 
-  // ── Utilities ──────────────────────────────────────────────────────────────
-
   close(): void {
     this.db.close();
   }
+}
+
+// ── Module-level helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Parses a 'YYYY-MM-DD' string as LOCAL midnight (00:00:00.000 local time).
+ *
+ * The ECMA spec states date-only ISO strings are parsed as UTC, not local.
+ * On a UTC+2 machine (Copenhagen): new Date('2026-05-06') = 02:00 local,
+ * then setHours(0) pulls it BACK 2 hours — correct but only by coincidence.
+ * For UTC-5 machines it would give 19:00 the PREVIOUS day, causing the
+ * start of the query window to fall on the wrong calendar day.
+ *
+ * Using explicit integer parts forces the JS Date constructor to use
+ * local time, eliminating the UTC→local ambiguity entirely.
+ */
+function localMidnight(dateStr: string): Date {
+  const [y, m, d] = dateStr.split('-').map(Number) as [number, number, number];
+  return new Date(y, m - 1, d, 0, 0, 0, 0); // month is 0-indexed
 }

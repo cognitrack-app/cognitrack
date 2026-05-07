@@ -1,6 +1,7 @@
 import React from 'react';
+import type { MobileData } from '../electron/preload/index';
 
-// ── Types ────────────────────────────────────────────────────────────────────
+// ── Types ────────────────────────────────────────────────────────────────────────
 
 interface TrayStats {
   isTracking:          boolean;
@@ -17,55 +18,66 @@ interface TrayStats {
 }
 
 interface TrayPopoverProps {
-  stats:    TrayStats;
-  loaded:   boolean;
-  onPause:  () => void;
-  onResume: () => void;
+  stats:         TrayStats;
+  loaded:        boolean;
+  onPause:       () => void;
+  onResume:      () => void;
+  mobileData:    MobileData | null;
+  mobileSyncing: boolean;
+  onSyncMobile:  () => void;
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────────────
 
-/** Returns a color from green → amber → red based on a 0-100 percentage. */
 function loadColor(pct: number): string {
   if (pct <= 40) return 'var(--color-good)';
   if (pct <= 70) return 'var(--color-warn)';
   return 'var(--color-danger)';
 }
 
-/** Returns a color for WM capacity (inverse — high is good). */
 function wmColor(pct: number): string {
   if (pct >= 60) return 'var(--color-good)';
   if (pct >= 30) return 'var(--color-warn)';
   return 'var(--color-danger)';
 }
 
-/** Format sync status into a terse label. */
 function syncLabel(sync: TrayStats['syncStatus']): string {
   if (sync.pending > 0 || sync.syncing > 0) return `${sync.pending + sync.syncing} pending`;
-  if (sync.failed > 0) return `${sync.failed} failed`;
-  if (sync.total === 0) return 'No data yet';
+  if (sync.failed > 0)                      return `${sync.failed} failed`;
+  if (sync.total === 0)                     return 'No data yet';
   return 'Synced';
 }
 
 function syncDotClass(sync: TrayStats['syncStatus']): string {
-  if (sync.failed > 0) return 'dot dot--danger';
-  if (sync.pending > 0 || sync.syncing > 0) return 'dot dot--warn';
+  if (sync.failed > 0)                          return 'dot dot--danger';
+  if (sync.pending > 0 || sync.syncing > 0)     return 'dot dot--warn';
   return 'dot dot--good';
 }
 
-// ── Component ────────────────────────────────────────────────────────────────
+// ── Component ──────────────────────────────────────────────────────────────────
 
 /**
- * TrayPopover — the ONLY screen in the desktop client.
+ * TrayPopover — the main screen in the desktop client.
  *
- * 260×200px frameless window. Shows 3 key metrics at a glance,
- * a sync indicator, and pause/resume + quit controls.
- * All dashboard and history UI lives on the mobile app.
+ * 260×280px frameless window. Shows desktop metrics, a Firestore sync
+ * indicator, mobile data snapshot, and pause/resume controls.
+ * All detailed history UI lives on the mobile app.
  */
-export function TrayPopover({ stats, loaded, onPause, onResume }: TrayPopoverProps) {
+export function TrayPopover({
+  stats,
+  loaded,
+  onPause,
+  onResume,
+  mobileData,
+  mobileSyncing,
+  onSyncMobile,
+}: TrayPopoverProps) {
+  const hasMobileData = mobileData !== null && typeof mobileData === 'object';
+
   return (
     <div className="popover" id="tray-popover">
-      {/* ── Header ──────────────────────────────────────────────────── */}
+
+      {/* ── Header ────────────────────────────────────────────── */}
       <header className="popover__header">
         <div className="popover__brand">
           <svg className="popover__logo" width="16" height="16" viewBox="0 0 16 16" fill="none">
@@ -86,10 +98,9 @@ export function TrayPopover({ stats, loaded, onPause, onResume }: TrayPopoverPro
         />
       </header>
 
-      {/* ── Divider ─────────────────────────────────────────────────── */}
       <div className="popover__divider" />
 
-      {/* ── Stats ───────────────────────────────────────────────────── */}
+      {/* ── Desktop stats ────────────────────────────────────────── */}
       {!loaded ? (
         <div className="popover__loading">Loading…</div>
       ) : (
@@ -111,10 +122,64 @@ export function TrayPopover({ stats, loaded, onPause, onResume }: TrayPopoverPro
         </div>
       )}
 
-      {/* ── Divider ─────────────────────────────────────────────────── */}
+      {/* ── Mobile data ──────────────────────────────────────────── */}
+      <div className="popover__divider" />
+      <div
+        className="popover__mobile"
+        style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+      >
+        <div className="popover__mobile-header">
+          <span className="popover__mobile-label">📱 Phone today</span>
+          <button
+            id="btn-sync-mobile"
+            className="popover__btn popover__btn--ghost"
+            onClick={onSyncMobile}
+            disabled={mobileSyncing}
+            title="Refresh phone data"
+            style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+          >
+            {mobileSyncing ? '⟳' : '↻'}
+          </button>
+        </div>
+
+        {mobileSyncing ? (
+          <div className="popover__mobile-value" style={{ color: 'var(--text-muted)' }}>Syncing…</div>
+        ) : hasMobileData ? (
+          <div style={{ display: 'flex', gap: '12px' }}>
+            {typeof mobileData!.cognitiveLoadPct === 'number' && (
+              <div className="popover__mobile-stat">
+                <span
+                  className="popover__mobile-val"
+                  style={{ color: loadColor(mobileData!.cognitiveLoadPct as number) }}
+                >
+                  {Math.round(mobileData!.cognitiveLoadPct as number)}%
+                </span>
+                <span className="popover__mobile-key">load</span>
+              </div>
+            )}
+            {typeof mobileData!.totalScreenTimeMin === 'number' && (
+              <div className="popover__mobile-stat">
+                <span className="popover__mobile-val">
+                  {Math.round((mobileData!.totalScreenTimeMin as number) / 60 * 10) / 10}h
+                </span>
+                <span className="popover__mobile-key">screen</span>
+              </div>
+            )}
+            {typeof mobileData!.appSwitches === 'number' && (
+              <div className="popover__mobile-stat">
+                <span className="popover__mobile-val">{mobileData!.appSwitches as number}</span>
+                <span className="popover__mobile-key">switches</span>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="popover__mobile-value" style={{ color: 'var(--text-muted)' }}>No phone data today</div>
+        )}
+      </div>
+
       <div className="popover__divider" />
 
-      {/* ── Footer ──────────────────────────────────────────────────── */}
+      {/* ── Footer ─────────────────────────────────────────────── */}
       <footer className="popover__footer">
         <div className="popover__sync" title="Firestore sync status">
           <span className={syncDotClass(stats.syncStatus)} />
@@ -140,11 +205,12 @@ export function TrayPopover({ stats, loaded, onPause, onResume }: TrayPopoverPro
           )}
         </div>
       </footer>
+
     </div>
   );
 }
 
-// ── Sub-components ───────────────────────────────────────────────────────────
+// ── Sub-components ────────────────────────────────────────────────────────────
 
 function StatRow({ label, value, color }: { label: string; value: string; color?: string }) {
   return (
