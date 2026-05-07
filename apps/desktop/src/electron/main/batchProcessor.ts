@@ -1,71 +1,11 @@
-import { calculateCognitiveDebt, resolveCategory } from '@cognitrack/shared';
-import type { AppEvent, BreakEvent, DesktopSyncPayload, DesktopCategoryBreakdown } from '@cognitrack/shared';
-
-const BREAK_MIN_DURATION_MS = 5 * 60 * 1000;   // 5 min minimum idle gap
-const BREAK_EFFICIENCY_THRESHOLD = 60;           // debt must drop >= this % to be 'STRUCTURED'
-
-/**
- * Scans sorted app events for idle gaps >= 5 minutes and constructs
- * BreakEvent records with debt_before / debt_after / efficiency_pct.
- *
- * Debt snapshots use the hourlyDebt array already produced by the
- * cognitive engine, so there is no re-derivation cost.
- */
-function detectBreakEvents(
-  events: AppEvent[],
-  hourlyDebt: number[],
-): BreakEvent[] {
-  if (events.length === 0) return [];
-
-  const breaks: BreakEvent[] = [];
-  const sorted = [...events].sort((a, b) => a.timestamp - b.timestamp);
-
-  for (let i = 0; i < sorted.length - 1; i++) {
-    const current = sorted[i]!;
-    const next    = sorted[i + 1]!;
-    const gap     = next.timestamp - current.timestamp;
-
-    if (gap < BREAK_MIN_DURATION_MS) continue;
-
-    const startDate      = new Date(current.timestamp);
-    const endDate        = new Date(next.timestamp);
-    const durationMinutes = Math.round(gap / 60_000);
-
-    // DESK-02 FIX: Use startDate.getHours() directly (the hour the break
-    // started), not getHours() - 1. The -1 read the previous hour's debt
-    // bucket, which is already decayed and underestimates break efficiency.
-    const hourBefore  = startDate.getHours();
-    const hourAfter   = Math.min(23, endDate.getHours());
-    const debtBefore  = hourlyDebt[hourBefore] ?? 0;
-    const debtAfter   = hourlyDebt[hourAfter]  ?? 0;
-    const ptsRecovered = Math.max(0, debtBefore - debtAfter);
-    const efficiencyPct = debtBefore === 0
-      ? 0
-      : Math.round((ptsRecovered / debtBefore) * 100);
-
-    const activityType: BreakEvent['activity_type'] =
-      durationMinutes >= 120                         ? 'SLEEP'
-      : efficiencyPct >= BREAK_EFFICIENCY_THRESHOLD  ? 'STRUCTURED'
-      : 'UNSTRUCTURED';
-
-    breaks.push({
-      start_time:       startDate.toISOString(),
-      end_time:         endDate.toISOString(),
-      activity_type:    activityType,
-      duration_minutes: durationMinutes,
-      debt_before:      debtBefore,
-      debt_after:       debtAfter,
-      pts_recovered:    ptsRecovered,
-      efficiency_pct:   efficiencyPct,
-    });
-  }
-
-  return breaks;
-}
+import { calculateCognitiveDebt } from '@cognitrack/shared';
+import type { AppEvent, DesktopSyncPayload, DesktopCategoryBreakdown } from '@cognitrack/shared';
 import type { BrowserWindow } from 'electron';
 import type { SQLiteStore } from './sqliteStore';
 import type { SyncEngine } from '@cognitrack/sync-engine';
+import type { ActiveWindowTracker } from './activeWindowTracker';
 import { getTodayDateString } from './utils';
+import { extractBreakEvents } from './breakExtractor';
 
 /**
  * BatchProcessor
@@ -88,6 +28,11 @@ export async function processBatch(
   userId: string,
   deviceId: string,
   mainWindow?: BrowserWindow | null,
+  // HIGH-7 FIX: tracker is required to read isRunning() for the live stats
+  // push. Previously isTracking was hardcoded to `true`, which caused the
+  // tray UI to revert to "tracking active" after every hourly batch even
+  // when the user had paused tracking.
+  tracker?: ActiveWindowTracker | null,
   date = getTodayDateString(),
 ): Promise<void> {
   const rawEvents: AppEvent[] = store.getEventsForDate(date);
@@ -97,10 +42,10 @@ export async function processBatch(
     return;
   }
 
-  // ── Run the shared cognitive state machine ─────────────────────────────
+  // ── Run the shared cognitive state machine ─────────────────────────────────────
   const report = calculateCognitiveDebt(rawEvents);
 
-  // ── Compute category breakdown (total durationMs per category) ────────
+  // ── Compute category breakdown (total durationMs per category) ────────────
   const durationByCategory: Record<string, number> = {};
   let totalFocusedMs = 0;
 
@@ -113,27 +58,43 @@ export async function processBatch(
   }
 
   const totalDuration = Object.values(durationByCategory).reduce((a, b) => a + b, 0) || 1;
+
+  // ROUNDING FIX: Use Math.floor for the first four categories, then let
+  // passiveWaste absorb the remainder so the sum is always exactly 100.
+  // Math.round() on all five can produce sums of 99 or 101 due to floating
+  // point representation — this caused Firestore validation errors downstream.
+  const _productive    = Math.floor(((durationByCategory['productive']    ?? 0) / totalDuration) * 100);
+  const _tools         = Math.floor(((durationByCategory['tools']         ?? 0) / totalDuration) * 100);
+  const _social        = Math.floor(((durationByCategory['social']        ?? 0) / totalDuration) * 100);
+  const _entertainment = Math.floor(((durationByCategory['entertainment'] ?? 0) / totalDuration) * 100);
   const categoryBreakdown: DesktopCategoryBreakdown = {
-    productive:    Math.round(((durationByCategory['productive'] ?? 0) / totalDuration) * 100),
-    tools:         Math.round(((durationByCategory['tools']      ?? 0) / totalDuration) * 100),
-    social:        Math.round(((durationByCategory['social']     ?? 0) / totalDuration) * 100),
-    entertainment: Math.round(((durationByCategory['entertainment'] ?? 0) / totalDuration) * 100),
-    passiveWaste:  Math.round(((durationByCategory['passiveWaste']  ?? 0) / totalDuration) * 100),
+    productive:    _productive,
+    tools:         _tools,
+    social:        _social,
+    entertainment: _entertainment,
+    passiveWaste:  100 - _productive - _tools - _social - _entertainment,
   };
 
-  const switchEvents   = rawEvents.filter(e => e.eventType === 'switch');
-  const totalSwitches  = switchEvents.length;
-  const totalFocusedTime = totalFocusedMs / 3_600_000; // convert ms → hours
+  const switchEvents     = rawEvents.filter(e => e.eventType === 'switch');
+  const totalSwitches    = switchEvents.length;
+  const totalFocusedTime = totalFocusedMs / 3_600_000; // ms → hours
 
-  // Peak switch velocity: max switches in any single hour
-  const hourlySwitches = new Array(24).fill(0) as number[];
-  for (const e of switchEvents) {
-    const hour = new Date(e.timestamp).getHours();
-    hourlySwitches[hour]++;
+  // PEAK VELOCITY FIX: O(n) two-pointer 5-minute sliding window.
+  // Previous implementation counted max switches per 1-hour bucket, which
+  // masked sub-hour bursts. E.g. 30 switches in 5 min within a quiet hour
+  // = 6/min peak — old algo would report 30/60 = 0.5/min (12× undercount).
+  // New: two-pointer expiry — left pointer expires events outside window,
+  // right pointer advances once. O(n) total, correct at any granularity.
+  let switchVelocityPeak = 0;
+  let left = 0;
+  for (let right = 0; right < switchEvents.length; right++) {
+    const windowStart = switchEvents[right]!.timestamp - 5 * 60_000;
+    while ((switchEvents[left]?.timestamp ?? 0) < windowStart) left++;
+    const rate = (right - left + 1) / 5; // switches per minute
+    if (rate > switchVelocityPeak) switchVelocityPeak = rate;
   }
-  const switchVelocityPeak = Math.max(...hourlySwitches);
 
-  // ── Persist computed metrics to SQLite daily_metrics table ────────────
+  // ── Persist computed metrics to SQLite daily_metrics table ────────────────
   store.upsertDailyMetrics({
     date,
     cognitiveDebt:       report.cognitiveDebt,
@@ -148,10 +109,13 @@ export async function processBatch(
     categoryBreakdown:   JSON.stringify(categoryBreakdown),
   });
 
-  // ── Push live stats update to the tray popover ────────────────────────
+  // ── Push live stats update to the tray popover ────────────────────────────
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('tray:statsUpdate', {
-      isTracking:          true,
+      // HIGH-7 FIX: was hardcoded `isTracking: true`. The tracker can be
+      // paused by the user at any time; hardcoding true caused the pause
+      // button to reappear after every hourly batch even when stopped.
+      isTracking:          tracker?.isRunning() ?? false,
       cognitiveLoadPct:    report.cognitiveLoadPct,
       totalSwitches,
       wmCapacityRemaining: report.wmCapacityRemaining,
@@ -159,10 +123,10 @@ export async function processBatch(
     });
   }
 
-  // ── Detect break events from idle gaps in today's event stream ────────
-  const break_events = detectBreakEvents(rawEvents, report.hourlyDebt);
+  // ── Extract break events from idle markers in today's event stream ────────
+  const break_events = extractBreakEvents(rawEvents, report.hourlyDebt);
 
-  // ── Build Firestore payload ────────────────────────────────────────────
+  // ── Build Firestore payload (11 scalars, zero raw data) ───────────────────
   const payload: DesktopSyncPayload = {
     deviceId,
     agentType:           'desktop',
@@ -181,12 +145,12 @@ export async function processBatch(
     lastUpdated:         new Date().toISOString(),
   };
 
-  // ── Push into offline sync queue (fires Firestore write when online) ──
+  // ── Push into offline sync queue (fires Firestore write when online) ──────
   syncEngine.push(userId, date, deviceId, payload);
   await syncEngine.flush();
 
   console.log(
     `[batch] ${date}: load=${report.cognitiveLoadPct}% switches=${totalSwitches} ` +
-    `wm=${report.wmCapacityRemaining} pushed to sync queue`
+    `wm=${report.wmCapacityRemaining}% pushed to sync queue`,
   );
 }

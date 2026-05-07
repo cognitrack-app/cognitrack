@@ -1,13 +1,9 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { onAuthStateChanged } from 'firebase/auth';
-// BUG-2 FIX: was `import { auth } from '../../../../packages/api-client/src/firebase'`
-// That is a raw relative cross-package path — it bypasses the workspace package
-// boundary and breaks in production builds where packages/ is NOT at ../../../../
-// relative to dist-renderer/. Use the workspace package name instead, which
-// resolves correctly at both dev and build time via pnpm workspace aliasing.
 import { auth } from '@cognitrack/api-client';
 import { TrayPopover } from './TrayPopover';
 import { SignInPopover } from './SignInPopover';
+import type { MobileData } from '../electron/preload/index';
 
 interface TrayStats {
   isTracking:          boolean;
@@ -38,23 +34,28 @@ const EMPTY_STATS: TrayStats = {
  *   - onAuthStateChanged fires immediately with the persisted Firebase auth
  *     state (fast path: < 1 s if token is cached).
  *   - If the user is not signed in, renders <SignInPopover /> which offers
- *     both Google OAuth and email/password.
- *   - After sign-in (either path), Firebase fires onAuthStateChanged →
- *     setIsAuthenticated(true) → renders <TrayPopover /> and signals main
- *     via window.electronAPI.signIn(uid) to unblock startup.
+ *     Google OAuth (signInWithPopup via setWindowOpenHandler) and email/password.
+ *   - After sign-in, Firebase fires onAuthStateChanged → setIsAuthenticated(true)
+ *     → renders <TrayPopover /> and signals main via window.electronAPI.signIn(uid).
  *
  * Stats flow:
  *   - Polls tray:getStats every 30 s as a heartbeat fallback.
- *   - Listens for real-time tray:statsUpdate pushed by main after each
- *     hourly batch — this is the primary update path (now fixed, see BUG-1).
+ *   - Listens for real-time tray:statsUpdate pushed by main after each hourly
+ *     batch — primary update path (BUG-1 fixed in preload).
+ *
+ * Mobile sync flow:
+ *   - On auth, fetches today's phone metrics from Firestore via IPC once.
+ *   - User can manually refresh via the ↻ button in TrayPopover.
  */
 export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [authChecked,     setAuthChecked]     = useState(false);
   const [stats,           setStats]           = useState<TrayStats>(EMPTY_STATS);
   const [loaded,          setLoaded]          = useState(false);
+  const [mobileData,      setMobileData]      = useState<MobileData | null>(null);
+  const [mobileSyncing,   setMobileSyncing]   = useState(false);
 
-  // ── Fetch stats from main process ──────────────────────────────────────
+  // ── Fetch desktop stats from main process ───────────────────────────────────
 
   const fetchStats = useCallback(async () => {
     if (!isAuthenticated) return;
@@ -67,7 +68,21 @@ export default function App() {
     }
   }, [isAuthenticated]);
 
-  // ── Auth state listener ──────────────────────────────────────────
+  // ── Fetch phone metrics from Firestore ──────────────────────────────────────
+
+  const fetchMobileData = useCallback(async () => {
+    setMobileSyncing(true);
+    try {
+      const data = await window.electronAPI.syncMobileData();
+      setMobileData(data);
+    } catch (err) {
+      console.error('[popover] Failed to fetch mobile ', err);
+    } finally {
+      setMobileSyncing(false);
+    }
+  }, []);
+
+  // ── Auth state listener ────────────────────────────────────────────────────
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
@@ -75,28 +90,24 @@ export default function App() {
       setAuthChecked(true);
       if (user) {
         // Signal main process to unblock waitForAuthFromRenderer().
-        // This fires for BOTH email/password AND Google OAuth — in the Google
-        // path, googleOAuth.ts already calls signIn() after the deep-link, but
-        // a second call is harmless (ipcMain.once deduplicates it).
+        // Fires for BOTH email/password AND Google OAuth paths.
         window.electronAPI.signIn(user.uid);
       }
     });
     return unsubscribe;
   }, []);
 
-  // ── Stats polling + live push subscription ────────────────────────
+  // ── Stats polling + live push subscription ───────────────────────────────
 
   useEffect(() => {
     if (!isAuthenticated) return;
 
-    // Initial fetch on mount
     fetchStats();
+    fetchMobileData(); // non-blocking: fetch phone data once on sign-in
 
-    // Heartbeat poll every 30 s (covers cases where main doesn't push updates)
     const interval = setInterval(fetchStats, 30_000);
 
     // Real-time push from main after each hourly batch (primary update path).
-    // Requires BUG-1 fix in preload — without it, this callback never fired.
     const cleanup = window.electronAPI.onStatsUpdate((data) => {
       setStats(data);
       setLoaded(true);
@@ -104,11 +115,11 @@ export default function App() {
 
     return () => {
       clearInterval(interval);
-      cleanup(); // remove ipcRenderer listener — prevents memory leak
+      cleanup();
     };
-  }, [fetchStats, isAuthenticated]);
+  }, [fetchStats, fetchMobileData, isAuthenticated]);
 
-  // ── Pause / resume handlers ──────────────────────────────────
+  // ── Pause / resume handlers ────────────────────────────────────────────
 
   const handlePause = useCallback(async () => {
     const result = await window.electronAPI.pauseTracking();
@@ -120,9 +131,8 @@ export default function App() {
     setStats(prev => ({ ...prev, isTracking: result.isTracking }));
   }, []);
 
-  // ── Render ───────────────────────────────────────────────────
+  // ── Render ───────────────────────────────────────────────────────────────────
 
-  // While Firebase resolves the persisted auth state (< 1 s normally)
   if (!authChecked) {
     return (
       <div className="popover">
@@ -141,6 +151,9 @@ export default function App() {
       loaded={loaded}
       onPause={handlePause}
       onResume={handleResume}
+      mobileData={mobileData}
+      mobileSyncing={mobileSyncing}
+      onSyncMobile={fetchMobileData}
     />
   );
 }
