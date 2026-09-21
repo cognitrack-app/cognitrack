@@ -1,4 +1,4 @@
-import { calculateCognitiveDebt } from '@cognitrack/shared';
+import { calculateCognitiveDebt, SYNC_PAYLOAD_SCHEMA_VERSION, FIVE_MIN_MS } from '@cognitrack/shared';
 import type { AppEvent, DesktopSyncPayload, DesktopCategoryBreakdown } from '@cognitrack/shared';
 import type { BrowserWindow } from 'electron';
 import type { SQLiteStore } from './sqliteStore';
@@ -88,7 +88,7 @@ export async function processBatch(
   let switchVelocityPeak = 0;
   let left = 0;
   for (let right = 0; right < switchEvents.length; right++) {
-    const windowStart = switchEvents[right]!.timestamp - 5 * 60_000;
+    const windowStart = switchEvents[right]!.timestamp - FIVE_MIN_MS;
     while ((switchEvents[left]?.timestamp ?? 0) < windowStart) left++;
     const rate = (right - left + 1) / 5; // switches per minute
     if (rate > switchVelocityPeak) switchVelocityPeak = rate;
@@ -126,6 +126,19 @@ export async function processBatch(
   // ── Extract break events from idle markers in today's event stream ────────
   const break_events = extractBreakEvents(rawEvents, report.hourlyDebt);
 
+  // ── Validate break_events structure ────────────────────────────────────────
+  // F-11 FIX: Ensure break_events array is valid and log if unexpectedly empty
+  // when idle events exist (indicating a gap in break extraction logic).
+  const hasIdleEvents = rawEvents.some(e => e.eventType === 'idle');
+  if (hasIdleEvents && break_events.length === 0) {
+    console.warn(`[batch] ${date}: Idle events present but no break_events extracted — check extractBreakEvents logic`);
+  }
+  for (const brk of break_events) {
+    if (!brk.start_time || !brk.end_time || typeof brk.duration_minutes !== 'number' || brk.duration_minutes <= 0) {
+      console.error(`[batch] ${date}: Invalid break_event detected:`, brk);
+    }
+  }
+
   // ── Build Firestore payload (11 scalars, zero raw data) ───────────────────
   const payload: DesktopSyncPayload = {
     deviceId,
@@ -143,6 +156,7 @@ export async function processBatch(
     hourlyLoad:          report.hourlyDebt,
     break_events,
     lastUpdated:         new Date().toISOString(),
+    schemaVersion:       SYNC_PAYLOAD_SCHEMA_VERSION,
   };
 
   // ── Push into offline sync queue (fires Firestore write when online) ──────

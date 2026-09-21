@@ -25,6 +25,7 @@ describe('derivations', () => {
     hourlyLoad: Array(24).fill(10),
     break_events: [],
     lastUpdated: new Date().toISOString(),
+    schemaVersion: 2,
   };
 
   const mockDesktopPayload: DesktopSyncPayload = {
@@ -49,6 +50,7 @@ describe('derivations', () => {
     hourlyLoad: Array(24).fill(15),
     break_events: [],
     lastUpdated: new Date().toISOString(),
+    schemaVersion: 2,
   };
 
   const mockSession: SessionDocument = {

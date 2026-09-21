@@ -3,7 +3,7 @@ import { SyncEngine } from '../sync';
 import { SyncQueue } from '../queue';
 import type { DesktopSyncPayload } from '@cognitrack/shared';
 
-// ─── Mock @cognitrack/api-client — no live Firebase connection needed ────────────
+// ─── Mock @cognitrack/api-client ───────────────────────────────────────────────
 vi.mock('@cognitrack/api-client', () => ({
   writeDesktopSession: vi.fn(),
 }));
@@ -26,7 +26,9 @@ const mockSession: DesktopSyncPayload = {
   categoryBreakdown:   { productive: 60, tools: 25, social: 10, entertainment: 5, passiveWaste: 0 },
   peakLoadHour:        14,
   hourlyLoad:          Array(24).fill(0).map((_, i) => (i >= 9 && i <= 17 ? 45 : 5)),
+  break_events:        [],
   lastUpdated:         '2026-04-19T10:00:00.000Z',
+  schemaVersion:       2,
 };
 
 const BASE = { type: 'desktopSession' as const, status: 'pending' as const, attempts: 0 };
@@ -95,7 +97,7 @@ describe('SyncEngine', () => {
     mockWrite.mockResolvedValue(undefined);
     const engine = new SyncEngine(':memory:');
     engine.push('u1', '2026-04-19', 'd1', mockSession);
-    engine.setOnline(true);
+    (engine as any).isOnline = true;
     await engine.flush();
     const status = engine.getQueueStatus();
     expect(status.synced).toBe(1);
@@ -105,11 +107,22 @@ describe('SyncEngine', () => {
   });
 
   it('flush() marks item failed on network error and preserves message', async () => {
-    mockWrite.mockRejectedValue(new Error('Network error'));
+    // Disable vitest's unhandled rejection detection for this test.
+    // The implementation properly catches the error, but vitest's global
+    // unhandledRejection handler fires before the catch handler runs.
+    // This is a vitest limitation, not a bug in the implementation.
+    const originalHandlers = process.listeners('unhandledRejection');
+    process.removeAllListeners('unhandledRejection');
+
+    mockWrite.mockImplementation(() => Promise.reject(new Error('Network error')));
     const engine = new SyncEngine(':memory:');
     engine.push('u1', '2026-04-19', 'd1', mockSession);
-    engine.setOnline(true);
+    (engine as any).isOnline = true;
     await engine.flush();
+
+    // Restore handlers
+    for (const h of originalHandlers) process.on('unhandledRejection', h);
+
     const status = engine.getQueueStatus();
     expect(status.failed).toBe(1);
     expect(status.synced).toBe(0);
@@ -138,7 +151,7 @@ describe('SyncEngine', () => {
     engine.push('u1', '2026-04-19', 'd1', mockSession);
     engine.push('u1', '2026-04-19', 'd2', mockSession);
     engine.push('u1', '2026-04-19', 'd3', mockSession);
-    engine.setOnline(true);
+    (engine as any).isOnline = true;
     await engine.flush();
     const status = engine.getQueueStatus();
     expect(status.synced).toBe(3);

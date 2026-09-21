@@ -19,11 +19,49 @@ export const TAU_MS = 7.67 * 60 * 1000; // 460,200 ms
 // ─── Cross-Device Multiplier ───────────────────────────────────────────────────
 export const CROSS_DEVICE_MULTIPLIER = 2.2;
 
+// ─── Pickup Penalty ──────────────────────────────────────────────────────────────
+export const PICKUP_PENALTY = 3.5;
+
 // ─── Normalisation Thresholds ──────────────────────────────────────────────────
 // Empirically: a very heavy day = ~500 raw debt units => 100% load
 export const DAILY_DEBT_THRESHOLD = 500;
 // Per-hour: a very heavy hour = ~40 raw debt units => 100%
 export const HOURLY_DEBT_THRESHOLD = 40;
+
+// ─── Sync Payload Schema Version ─────────────────────────────────────────────────
+// Increment when payload structure changes in a backward-incompatible way.
+// v1: Initial release
+// v2: Added break_events, 5-category breakdown (tools), cross-device multiplier parity
+export const SYNC_PAYLOAD_SCHEMA_VERSION = 2;
+
+// ─── Shared Timing Constants ─────────────────────────────────────────────────────
+// 5-minute window for velocity calculation and break detection
+export const FIVE_MIN_MS = 5 * 60 * 1000; // 300,000 ms
+// 7-day TTL for local event storage
+export const TTL_SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000; // 604,800,000 ms
+// Base backoff for sync retry (30 seconds)
+export const BACKOFF_BASE_MS = 30 * 1000; // 30,000 ms
+// Velocity multiplier cap at 4 switches/min
+export const VELOCITY_CAP_SWITCHES_PER_MIN = 4;
+
+// ─── Break Classification Thresholds ────────────────────────────────────────────
+// Minimum break duration to track (5 minutes)
+export const MIN_BREAK_MS = FIVE_MIN_MS;
+// Structured break threshold (20 minutes)
+export const STRUCTURED_BREAK_MIN = 20;
+// Sleep/overnight break threshold (8 hours = 480 minutes)
+export const SLEEP_BREAK_MIN = 480;
+
+// ─── Adaptive Sync Configuration (Desktop) ──────────────────────────────────────
+// Desktop sync runs on a timer with adaptive interval based on cognitive state changes.
+// Floor: minimum interval between syncs (15 min) — prevents battery drain
+// Ceiling: maximum interval (60 min) — ensures data freshness for merge
+// Triggers: sync immediately if cognitive load delta > 15% OR velocity delta > 2.0 switches/min
+export const ADAPTIVE_SYNC_MIN_INTERVAL_MS = 15 * 60 * 1000;     // 15 min = 900,000 ms
+export const ADAPTIVE_SYNC_MAX_INTERVAL_MS = 60 * 60 * 1000;     // 60 min = 3,600,000 ms
+export const ADAPTIVE_SYNC_LOAD_DELTA_THRESHOLD_PCT = 15;        // % cognitive load change
+export const ADAPTIVE_SYNC_VELOCITY_DELTA_THRESHOLD = 2.0;       // switches/min change
+export const ADAPTIVE_SYNC_JITTER_MS = 5 * 60 * 1000;            // ±5 min thundering-herd avoidance
 
 // ─── Context Distance Matrix (Asymmetric) ──────────────────────────────────────
 // FROM category (row) → TO category (col)

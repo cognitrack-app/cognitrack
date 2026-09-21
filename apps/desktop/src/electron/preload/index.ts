@@ -83,7 +83,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
    * FIX: rename to ` TrayStats` — typed correctly and in scope.
    */
   onStatsUpdate: (cb: (stats: TrayStats) => void): (() => void) => {
-    const handler = (_event: Electron.IpcRendererEvent,  TrayStats): void => cb(data);
+    const handler = (_event: Electron.IpcRendererEvent, stats: TrayStats): void => cb(stats);
     ipcRenderer.on('tray:statsUpdate', handler);
     return () => ipcRenderer.removeListener('tray:statsUpdate', handler);
   },

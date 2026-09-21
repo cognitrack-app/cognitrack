@@ -6,3 +6,4 @@ export * from './velocityMultiplier';
 export * from './appNormalizer';
 export * from './fragmentation';
 export * from './cognitiveEngine';
+export * from './syncUtils';

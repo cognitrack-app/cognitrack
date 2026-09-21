@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { onAuthStateChanged } from 'firebase/auth';
-import { auth } from '@cognitrack/api-client';
+import { auth } from './firebase';
 import { TrayPopover } from './TrayPopover';
 import { SignInPopover } from './SignInPopover';
 import type { MobileData } from '../electron/preload/index';

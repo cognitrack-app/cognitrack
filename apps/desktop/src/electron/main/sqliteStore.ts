@@ -87,7 +87,7 @@ export class SQLiteStore {
         ON app_events(timestamp);
 
       -- 7-day TTL: delete events older than 7 days on every insert
-      -- 604800000 ms = 7 days
+      -- TTL_SEVEN_DAYS_MS = 604800000 ms = 7 days (defined in @cognitrack/shared)
       CREATE TRIGGER IF NOT EXISTS ttl_app_events
       AFTER INSERT ON app_events
       BEGIN

@@ -1,11 +1,13 @@
-import type { AppEvent, Category, CognitiveReport, CognitiveState } from './types';
+import type { AppEvent, Category, CognitiveReport, CognitiveState, DeviceType } from './types';
 import {
   CONTEXT_DISTANCE,
+  CROSS_DEVICE_MULTIPLIER,
   DAILY_DEBT_THRESHOLD,
   FOCUS_BUILD_THRESHOLD_MS,
   FOCUS_DEPTH_GAIN,
   FOCUS_DEPTH_MAX,
   HOURLY_DEBT_THRESHOLD,
+  PICKUP_PENALTY,
   WM_BREAK_GAIN,
   WM_FLOOR,
   WM_FOCUS_GAIN,
@@ -75,6 +77,7 @@ export function calculateCognitiveDebt(events: AppEvent[]): CognitiveReport {
   };
 
   let lastCategory: Category | null = null;
+  let lastDeviceType: DeviceType | null = null;
   let totalDebt = 0;
 
   // Raw debt accumulated per hour (index = 0–23)
@@ -108,8 +111,13 @@ export function calculateCognitiveDebt(events: AppEvent[]): CognitiveReport {
       const switchesPerMin = recentSwitchTs.length / 5;
       const velocityMult = computeVelocityMultiplier(switchesPerMin);
 
-      // 4. Adjusted switch cost
-      const adjustedCost = switchCost * velocityMult;
+      // 4. Cross-device multiplier: apply 2.2× when switching between phone and desktop
+      // This matches Dart: isCrossDevice = prev.deviceType !== curr.deviceType
+      const isCrossDevice = lastDeviceType !== null && lastDeviceType !== event.deviceType;
+      const deviceMult = isCrossDevice ? CROSS_DEVICE_MULTIPLIER : 1.0;
+
+      // 5. Adjusted switch cost: context distance × velocity × cross-device
+      const adjustedCost = switchCost * velocityMult * deviceMult;
 
       // 5. Stack new residue on top of decayed old residue (use adjustedCost
       //    so the velocity multiplier amplifies residue at the same rate as
@@ -136,6 +144,7 @@ export function calculateCognitiveDebt(events: AppEvent[]): CognitiveReport {
       state.last_switch_ts = event.timestamp;
       state.last_residue_decay_ts = event.timestamp;
       lastCategory = event.category;
+      lastDeviceType = event.deviceType;
 
     } else if (event.eventType === 'break' || event.eventType === 'idle') {
       // Reward verified break
@@ -150,8 +159,23 @@ export function calculateCognitiveDebt(events: AppEvent[]): CognitiveReport {
       // Reset velocity window after a real break
       recentSwitchTs.length = 0;
 
+    } else if (event.eventType === 'pickup') {
+      // 3. Cross-device multiplier for pickups: phone pickup during desktop work
+      // In practice, pickup events only come from phone, so this applies when
+      // the previous event was from desktop (cross-device transition).
+      const isCrossDevice = lastDeviceType !== null && lastDeviceType === 'desktop';
+      const deviceMult = isCrossDevice ? CROSS_DEVICE_MULTIPLIER : 1.0;
+
+      // Apply pickup penalty with cross-device multiplier
+      const pickupCost = PICKUP_PENALTY * deviceMult;
+      totalDebt += pickupCost;
+      hourlyRaw[hour] += pickupCost;
+
+      // Pickups also add residue (they're interruptions)
+      state.residue = applySwitch(state.residue, 0, pickupCost);
+
     } else {
-      // eventType === 'pickup' or uninterrupted active time
+      // eventType === uninterrupted active time (no switch)
       // Check for sustained focus reward
       const msSinceLast = event.timestamp - state.last_switch_ts;
       if (msSinceLast >= FOCUS_BUILD_THRESHOLD_MS && lastCategory !== null) {
