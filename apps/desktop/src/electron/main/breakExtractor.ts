@@ -1,7 +1,5 @@
 import type { AppEvent, BreakEvent } from '@cognitrack/shared';
-
-/** Minimum continuous idle duration to count as a trackable break. */
-const MIN_BREAK_MS = 5 * 60_000; // 5 minutes
+import { MIN_BREAK_MS, STRUCTURED_BREAK_MIN, SLEEP_BREAK_MIN } from '@cognitrack/shared';
 
 /**
  * Extracts BreakEvent[] from a sorted day's AppEvent array.
@@ -56,9 +54,9 @@ export function extractBreakEvents(
     const durationMin  = Math.round(durationMs / 60_000);
 
     const activityType: BreakEvent['activity_type'] =
-      durationMin >= 480 ? 'SLEEP'       // ≥ 8 h
-      : durationMin >= 20 ? 'STRUCTURED'  // 20–479 min
-      : 'IDLE';                           // 5–19 min
+      durationMin >= SLEEP_BREAK_MIN ? 'SLEEP'
+      : durationMin >= STRUCTURED_BREAK_MIN ? 'STRUCTURED'
+      : 'IDLE';
 
     breaks.push({
       start_time:       new Date(e.timestamp).toISOString(),

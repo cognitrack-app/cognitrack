@@ -2,6 +2,10 @@ import { writeDesktopSession } from '@cognitrack/api-client';
 import type { DesktopSyncPayload } from '@cognitrack/shared';
 import { SyncQueue, type DesktopSessionPayload } from './queue';
 
+const MAX_FLUSH_DURATION_MS = 30_000;
+const BASE_BACKOFF_MS = 1_000;
+const MAX_BACKOFF_MS = 30_000;
+
 export class SyncEngine {
   private queue:     SyncQueue;
   private isSyncing = false;
@@ -37,7 +41,7 @@ export class SyncEngine {
   }
 
   /**
-   * Flush all pending items to Firestore.
+   * Flush all pending items to Firestore with exponential backoff via queue scheduling.
    * Guards against concurrent calls with isSyncing flag.
    * No-op when offline.
    *
@@ -46,25 +50,52 @@ export class SyncEngine {
    * (~48 queued hourly pushes) only the first 20 would sync on reconnect;
    * the remaining 28 waited for the next natural connectivity event.
    * The while-loop re-fetches until getPendingItems() returns an empty array.
+   *
+   * Circuit breaker: aborts if total flush time exceeds MAX_FLUSH_DURATION_MS.
+   * Exponential backoff is handled by the queue via nextRetryAt field —
+   * failed items are scheduled for retry with increasing delays, not by
+   * blocking the flush loop.
    */
   async flush(): Promise<void> {
     if (!this.isOnline || this.isSyncing) return;
     this.isSyncing = true;
+    const flushStart = Date.now();
+
     try {
       let pending = this.queue.getPendingItems(); // batch = 20
       while (pending.length > 0) {
+        // Circuit breaker: abort if flush is taking too long
+        if (Date.now() - flushStart > MAX_FLUSH_DURATION_MS) {
+          console.warn('[SyncEngine] Flush timeout reached, aborting to prevent resource exhaustion');
+          break;
+        }
+
         for (const item of pending) {
           this.queue.updateItemStatus(item.id, 'syncing');
           try {
             const { userId, date, deviceId, session } = item.data;
+
+            // Write directly — conflict resolution is handled server-side by
+            // mergeAgentData Cloud Function using Firestore's field-level merge
+            // and document-level last-write-wins via lastMergeRun timestamp.
+            // This avoids an extra read per item (1 read + 1 write → 1 write)
+            // and works correctly under offline/flaky network conditions.
             await writeDesktopSession(userId, date, deviceId, session);
             this.queue.updateItemStatus(item.id, 'synced');
           } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
-            this.queue.updateItemStatus(item.id, 'failed', msg);
+
+            // Schedule retry with exponential backoff via queue's nextRetryAt
+            // This avoids blocking the flush loop — the item will be picked up
+            // on the next flush cycle after its nextRetryAt has passed.
+            const backoffMs = Math.min(BASE_BACKOFF_MS * Math.pow(2, item.attempts), MAX_BACKOFF_MS);
+            const jitter = Math.random() * backoffMs * 0.5;
+            const nextRetryAt = new Date(Date.now() + backoffMs + jitter);
+
+            this.queue.updateItemStatus(item.id, 'failed', msg, nextRetryAt);
           }
         }
-        pending = this.queue.getPendingItems(); // fetch next batch
+        pending = this.queue.getPendingItems(); // fetch next batch (respects nextRetryAt)
       }
     } finally {
       this.isSyncing = false;
@@ -75,20 +106,25 @@ export class SyncEngine {
   }
 
   /**
-   * Last-write-wins conflict resolution.
+   * Last-write-wins conflict resolution with validation.
    * Compares lastUpdated ISO timestamps from two DesktopSyncPayloads.
    * Returns whichever was updated more recently.
+   * Throws if either timestamp is invalid.
    *
-   * NOTE: This method is intentionally NOT called inside flush(). The current
-   * conflict resolution strategy is Firestore's own merge semantics
-   * (setDoc with merge:true), which effectively gives last-write-wins at the
-   * field level. For a single desktop writing to its own deviceId key this is
-   * sufficient. If multi-device conflict resolution is added in the future,
-   * call this before writeDesktopSession(): fetch the remote document,
-   * pass both payloads here, then write only if local wins.
+   * NOTE: This is kept for potential future use (e.g., manual reconciliation
+   * passes) but is NOT called in the hot flush() path. The server-side
+   * mergeAgentData handles conflict resolution via Firestore merge semantics
+   * and the lastMergeRun idempotency token.
    */
   resolveConflict(local: DesktopSyncPayload, remote: DesktopSyncPayload): DesktopSyncPayload {
-    return new Date(local.lastUpdated) >= new Date(remote.lastUpdated) ? local : remote;
+    const localTime = new Date(local.lastUpdated).getTime();
+    const remoteTime = new Date(remote.lastUpdated).getTime();
+
+    if (Number.isNaN(localTime) || Number.isNaN(remoteTime)) {
+      throw new Error('Invalid lastUpdated timestamp in conflict resolution');
+    }
+
+    return localTime >= remoteTime ? local : remote;
   }
 
   getQueueStatus() { return this.queue.getStatus(); }

@@ -13,6 +13,14 @@ export default defineConfig({
   root: path.resolve(__dirname, 'src/renderer'),
   base: './',
   plugins: [react()],
+  resolve: {
+    alias: {
+      '@cognitrack/api-client': path.resolve(__dirname, '../../packages/api-client/dist'),
+      '@cognitrack/shared': path.resolve(__dirname, '../../packages/shared/dist'),
+      '@cognitrack/sync-engine': path.resolve(__dirname, '../../packages/sync-engine/dist'),
+    },
+    preserveSymlinks: true,
+  },
   define: {
     'process.env.FIREBASE_API_KEY': JSON.stringify(process.env.FIREBASE_API_KEY),
     'process.env.FIREBASE_AUTH_DOMAIN': JSON.stringify(process.env.FIREBASE_AUTH_DOMAIN),

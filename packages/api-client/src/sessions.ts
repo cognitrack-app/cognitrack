@@ -9,7 +9,6 @@ import {
   getDocs,
   onSnapshot,
   serverTimestamp,
-  Timestamp,
 } from 'firebase/firestore';
 import { db } from './firebase';
 import type { DesktopSyncPayload, PhoneSyncPayload, SessionDocument } from '@cognitrack/shared';
@@ -30,8 +29,9 @@ export type { SessionDocument } from '@cognitrack/shared';
  *   desktopSessions.{deviceId} = DesktopSyncPayload
  *
  * The mergeAgentData Cloud Function triggers on this exact path and field.
- * Using setDoc + merge:true so repeated writes from the same device on the
- * same day accumulate — they don't overwrite unrelated fields.
+ * Using setDoc with merge:true provides field-level atomicity for concurrent
+ * writes to different desktopSessions.{deviceId} keys — no transaction needed
+ * since each device writes to its own unique field path.
  */
 export async function writeDesktopSession(
   userId: string,
@@ -41,6 +41,10 @@ export async function writeDesktopSession(
 ): Promise<void> {
   // ✔ Correct path: users/{userId}/sessions/{date}
   const ref = doc(db, 'users', userId, 'sessions', date);
+
+  // setDoc with merge:true provides field-level atomicity for concurrent writes
+  // to different desktopSessions.{deviceId} keys. No transaction needed since
+  // there's no read-modify-write cycle — each device writes to its own field.
   await setDoc(
     ref,
     {
@@ -57,6 +61,9 @@ export async function writeDesktopSession(
 /**
  * Write a phone sync payload into Firestore.
  * Path: users/{userId}/sessions/{date}
+ *
+ * Uses setDoc with merge:true for field-level atomicity (matches writeDesktopSession pattern).
+ * This prevents potential field-level conflicts when multiple phones write simultaneously.
  */
 export async function writePhoneSession(
   userId: string,
@@ -64,6 +71,9 @@ export async function writePhoneSession(
   payload: PhoneSyncPayload,
 ): Promise<void> {
   const ref = doc(db, 'users', userId, 'sessions', date);
+
+  // setDoc with merge:true provides field-level atomicity. No transaction needed
+  // since there's no read-modify-write cycle.
   await setDoc(
     ref,
     {
@@ -167,4 +177,44 @@ export async function fetchSessionByDate(
   const ref  = doc(db, 'users', userId, 'sessions', date);
   const snap = await getDoc(ref);
   return snap.exists() ? ({ ...snap.data(), date: snap.id } as SessionDocument) : null;
+}
+
+/**
+ * Fetch a single desktop session payload by date and deviceId.
+ * Returns the desktop payload for the given device, or null if not found.
+ * Used for conflict resolution during sync.
+ * Validates the payload shape to catch malformed data early.
+ */
+export async function readDesktopSession(
+  userId: string,
+  date: string,
+  deviceId: string,
+): Promise<DesktopSyncPayload | null> {
+  const session = await fetchSessionByDate(userId, date);
+  if (!session || !session.desktopSessions) return null;
+  const payload = session.desktopSessions[deviceId] ?? null;
+  if (!payload) return null;
+
+  // Validate payload shape — same checks as merge.ts server-side
+  if (!payload.hourlyLoad || !Array.isArray(payload.hourlyLoad) || payload.hourlyLoad.length !== 24) {
+    console.warn(`[api-client] readDesktopSession: invalid hourlyLoad for ${deviceId}`);
+    return null;
+  }
+  for (let i = 0; i < 24; i++) {
+    const val = payload.hourlyLoad[i];
+    if (typeof val !== 'number' || Number.isNaN(val)) {
+      console.warn(`[api-client] readDesktopSession: invalid hourlyLoad[${i}] for ${deviceId}`);
+      return null;
+    }
+  }
+  if (typeof payload.cognitiveLoadPct !== 'number' || Number.isNaN(payload.cognitiveLoadPct)) {
+    console.warn(`[api-client] readDesktopSession: invalid cognitiveLoadPct for ${deviceId}`);
+    return null;
+  }
+  if (typeof payload.totalFocusedTime !== 'number' || Number.isNaN(payload.totalFocusedTime)) {
+    console.warn(`[api-client] readDesktopSession: invalid totalFocusedTime for ${deviceId}`);
+    return null;
+  }
+
+  return payload;
 }

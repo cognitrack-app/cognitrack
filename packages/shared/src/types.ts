@@ -92,8 +92,9 @@ export interface PhoneSyncPayload {
   categoryBreakdown: CategoryBreakdown;
   peakLoadHour: number;
   hourlyLoad: number[];           // 24-element, 0-100
-  break_events: BreakEvent[];     // NEW — per-break quality records
+  break_events: BreakEvent[];     // per-break quality records
   lastUpdated: string;            // ISO timestamp
+  schemaVersion: number;          // payload schema version for migration
 }
 
 // ─── Desktop Sync Payload ─────────────────────────────────────────────────────
@@ -111,8 +112,9 @@ export interface DesktopSyncPayload {
   categoryBreakdown: DesktopCategoryBreakdown;
   peakLoadHour: number;
   hourlyLoad: number[];           // 24-element, 0-100
-  break_events: BreakEvent[];     // NEW — mirrors phone field
+  break_events: BreakEvent[];     // per-break quality records
   lastUpdated: string;
+  schemaVersion: number;          // payload schema version for migration
 }
 
 // ─── Session Document (Firestore: /users/{uid}/sessions/{date}) ───────────────
@@ -129,7 +131,9 @@ export interface SessionDocument {
   combinedSwitchesTotal?: number;
   combinedSwitchVelocityPeak?: number;
   combinedHourlyLoad?: number[];  // element-wise max(phone, desktop) per hour
-  lastMergeRun?: string;
+  // In Firestore this is a server Timestamp; when serialized to JSON it becomes a string.
+  // Consumers reading directly from Firestore SDK will get a Timestamp object with .toDate().
+  lastMergeRun?: string | { toDate(): Date };
   /** Written by dailyReset Cloud Function each morning. */
   carryover_debt_pts?:  number;
   carryover_residue?:   number;   // 0–100

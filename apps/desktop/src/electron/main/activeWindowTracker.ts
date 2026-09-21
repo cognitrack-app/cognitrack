@@ -9,6 +9,10 @@ import type { Result as ActiveWinResult } from 'active-win';
 const POLL_INTERVAL_MS = 5_000; // 5-second poll (PRD spec)
 const IDLE_THRESHOLD_S = 60; // 60s of no input = idle / break
 
+// Windows explorer.exe restart handling
+const MAX_ACTIVE_WIN_RETRIES = 3;
+const ACTIVE_WIN_RETRY_BASE_MS = 1000;
+
 let activeWin: (() => Promise<ActiveWinResult | undefined>) | null = null;
 
 /**
@@ -20,6 +24,14 @@ async function getActiveWin(): Promise<() => Promise<ActiveWinResult | undefined
   const mod = await import('active-win');
   activeWin = mod.default ?? mod;
   return activeWin!;
+}
+
+/**
+ * Resets the active-win cache to force re-initialization.
+ * Called when explorer.exe restarts on Windows to recover from stale state.
+ */
+function resetActiveWinCache(): void {
+  activeWin = null;
 }
 
 /**
@@ -112,8 +124,13 @@ export class ActiveWindowTracker {
       result = await fn();
     } catch (err) {
       // active-win can throw when Accessibility permissions are missing on macOS,
-      // or when explorer.exe restarts on Windows. Log and skip this tick.
-      console.warn('[tracker] active-win error (skipping tick):', err);
+      // or when explorer.exe restarts on Windows.
+      // On Windows, retry with exponential backoff to recover from explorer.exe restart.
+      if (process.platform === 'win32') {
+        await this.handleActiveWinError(err);
+      } else {
+        console.warn('[tracker] active-win error (skipping tick):', err);
+      }
       return;
     }
 
@@ -147,6 +164,37 @@ export class ActiveWindowTracker {
       // break period will insert a fresh idle marker.
       this.isIdle = false;
     }
+  }
+
+  /**
+   * Handles active-win errors on Windows with retry logic for explorer.exe restarts.
+   * Uses exponential backoff: 1s, 2s, 4s... up to MAX_ACTIVE_WIN_RETRIES attempts.
+   */
+  private async handleActiveWinError(err: unknown): Promise<void> {
+    console.warn('[tracker] active-win error on Windows, attempting recovery:', err);
+
+    // Reset the active-win cache to force re-initialization
+    resetActiveWinCache();
+
+    for (let attempt = 1; attempt <= MAX_ACTIVE_WIN_RETRIES; attempt++) {
+      const delay = ACTIVE_WIN_RETRY_BASE_MS * Math.pow(2, attempt - 1);
+      console.log(`[tracker] Retrying active-win (attempt ${attempt}/${MAX_ACTIVE_WIN_RETRIES}) after ${delay}ms`);
+
+      await new Promise(resolve => setTimeout(resolve, delay));
+
+      try {
+        const fn = await getActiveWin();
+        const result = await fn();
+        if (result) {
+          console.log('[tracker] active-win recovered successfully');
+          return;
+        }
+      } catch (retryErr) {
+        console.warn(`[tracker] active-win retry ${attempt} failed:`, retryErr);
+      }
+    }
+
+    console.error('[tracker] active-win failed to recover after all retries');
   }
 
   // ── System idle handler (arrow fn so `this` is always bound) ─────────────

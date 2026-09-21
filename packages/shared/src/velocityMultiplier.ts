@@ -1,4 +1,5 @@
 import type { AppEvent } from './types';
+import { FIVE_MIN_MS, VELOCITY_CAP_SWITCHES_PER_MIN } from './constants';
 
 /**
  * Linear penalty for rapid context switching.
@@ -8,7 +9,7 @@ import type { AppEvent } from './types';
  */
 export function computeVelocityMultiplier(switchesPerMinute: number): number {
   if (switchesPerMinute <= 1.0) return 1.0;
-  if (switchesPerMinute >= 4.0) return 2.5;
+  if (switchesPerMinute >= VELOCITY_CAP_SWITCHES_PER_MIN) return 2.5;
   return 1.0 + (switchesPerMinute - 1.0) * 0.5;
 }
 
@@ -18,7 +19,7 @@ export function computeVelocityMultiplier(switchesPerMinute: number): number {
  */
 export function getSwitchVelocity(
   events: AppEvent[],
-  windowMs = 5 * 60 * 1000
+  windowMs = FIVE_MIN_MS
 ): number {
   if (events.length === 0) return 0;
   const now = events[events.length - 1]!.timestamp;

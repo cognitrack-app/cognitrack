@@ -11,25 +11,27 @@ export interface DesktopSessionPayload {
 }
 
 export interface QueueItem {
-  id:        string;
-  type:      'desktopSession';
-  data:      DesktopSessionPayload;
-  status:    QueueStatus;
-  createdAt: Date;
-  updatedAt: Date;
-  attempts:  number;
-  error?:    string;
+  id:          string;
+  type:        'desktopSession';
+  data:        DesktopSessionPayload;
+  status:      QueueStatus;
+  createdAt:   Date;
+  updatedAt:   Date;
+  attempts:    number;
+  error?:      string;
+  nextRetryAt?: Date;  // For exponential backoff scheduling
 }
 
 interface QueueRow {
-  id:         string;
-  type:       string;
-  data:       string;
-  status:     string;
-  created_at: string;
-  updated_at: string;
-  attempts:   number;
-  error:      string | null;
+  id:            string;
+  type:          string;
+  data:          string;
+  status:        string;
+  created_at:    string;
+  updated_at:    string;
+  attempts:      number;
+  error:         string | null;
+  next_retry_at: string | null;
 }
 
 export class SyncQueue {
@@ -46,14 +48,15 @@ export class SyncQueue {
   private init(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS queue (
-        id         TEXT PRIMARY KEY,
-        type       TEXT NOT NULL,
-        data       TEXT NOT NULL,
-        status     TEXT NOT NULL DEFAULT 'pending',
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        attempts   INTEGER NOT NULL DEFAULT 0,
-        error      TEXT
+        id              TEXT PRIMARY KEY,
+        type            TEXT NOT NULL,
+        data            TEXT NOT NULL,
+        status          TEXT NOT NULL DEFAULT 'pending',
+        created_at      TEXT NOT NULL,
+        updated_at      TEXT NOT NULL,
+        attempts        INTEGER NOT NULL DEFAULT 0,
+        error           TEXT,
+        next_retry_at   TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status);
     `);
@@ -63,22 +66,26 @@ export class SyncQueue {
     const id  = `${item.type}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
     const now = new Date().toISOString();
     this.db.prepare(
-      'INSERT INTO queue (id, type, data, status, created_at, updated_at, attempts) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    ).run(id, item.type, JSON.stringify(item.data), item.status, now, now, item.attempts);
+      'INSERT INTO queue (id, type, data, status, created_at, updated_at, attempts, next_retry_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(id, item.type, JSON.stringify(item.data), item.status, now, now, item.attempts, item.nextRetryAt?.toISOString() ?? null);
     return id;
   }
 
   getPendingItems(batchSize = 20): QueueItem[] {
+    const now = new Date().toISOString();
     const rows = this.db.prepare(
-      `SELECT * FROM queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?`
-    ).all(batchSize) as QueueRow[];
+      `SELECT * FROM queue WHERE status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= ?) ORDER BY created_at ASC LIMIT ?`
+    ).all(now, batchSize) as QueueRow[];
     return rows.map(r => this.hydrate(r));
   }
 
-  updateItemStatus(id: string, status: QueueStatus, error?: string): void {
+  updateItemStatus(id: string, status: QueueStatus, error?: string, nextRetryAt?: Date): void {
+    // Only increment attempts on actual failures, not on 'syncing' or 'synced' transitions.
+    // This ensures requeueFailed(maxRetries) correctly counts real network failures.
+    const incrementAttempts = status === 'failed';
     this.db.prepare(
-      'UPDATE queue SET status = ?, updated_at = ?, attempts = attempts + 1, error = ? WHERE id = ?'
-    ).run(status, new Date().toISOString(), error ?? null, id);
+      `UPDATE queue SET status = ?, updated_at = ?, attempts = attempts + ${incrementAttempts ? 1 : 0}, error = ?, next_retry_at = ? WHERE id = ?`
+    ).run(status, new Date().toISOString(), error ?? null, nextRetryAt?.toISOString() ?? null, id);
   }
 
   getItem(id: string): QueueItem | null {
@@ -95,7 +102,7 @@ export class SyncQueue {
 
   requeueFailed(maxRetries = 5): void {
     this.db.prepare(
-      `UPDATE queue SET status = 'pending' WHERE status = 'failed' AND attempts < ?`
+      `UPDATE queue SET status = 'pending', next_retry_at = NULL WHERE status = 'failed' AND attempts < ?`
     ).run(maxRetries);
   }
 
@@ -111,7 +118,7 @@ export class SyncQueue {
    */
   requeueStuckSyncing(): void {
     const result = this.db.prepare(
-      `UPDATE queue SET status = 'pending', updated_at = ? WHERE status = 'syncing'`
+      `UPDATE queue SET status = 'pending', updated_at = ?, next_retry_at = NULL WHERE status = 'syncing'`
     ).run(new Date().toISOString());
     if (result.changes > 0) {
       console.log(`[queue] Recovered ${result.changes} item(s) stuck in 'syncing' state`);
@@ -162,14 +169,15 @@ export class SyncQueue {
 
   private hydrate(row: QueueRow): QueueItem {
     return {
-      id:        row.id,
-      type:      row.type as 'desktopSession',
-      data:      JSON.parse(row.data) as DesktopSessionPayload,
-      status:    row.status as QueueStatus,
-      createdAt: new Date(row.created_at),
-      updatedAt: new Date(row.updated_at),
-      attempts:  row.attempts,
-      error:     row.error ?? undefined,
+      id:            row.id,
+      type:          row.type as 'desktopSession',
+      data:          JSON.parse(row.data) as DesktopSessionPayload,
+      status:        row.status as QueueStatus,
+      createdAt:     new Date(row.created_at),
+      updatedAt:     new Date(row.updated_at),
+      attempts:      row.attempts,
+      error:         row.error ?? undefined,
+      nextRetryAt:   row.next_retry_at ? new Date(row.next_retry_at) : undefined,
     };
   }
 }

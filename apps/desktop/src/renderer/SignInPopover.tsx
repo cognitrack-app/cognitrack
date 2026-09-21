@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { signInWithEmailAndPassword, GoogleAuthProvider, signInWithPopup } from 'firebase/auth';
-import { auth } from '@cognitrack/api-client';
+import { auth } from './firebase';
 
 /**
  * SignInPopover — shown when the user is not authenticated.

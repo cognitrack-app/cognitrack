@@ -12,6 +12,13 @@ import { processBatch } from './electron/main/batchProcessor';
 import { SyncEngine } from '@cognitrack/sync-engine';
 import { registerDevice, onAuthChange } from '@cognitrack/api-client';
 import { ensureAccessibilityPermission } from './electron/main/macPermissions';
+import {
+  ADAPTIVE_SYNC_MIN_INTERVAL_MS,
+  ADAPTIVE_SYNC_MAX_INTERVAL_MS,
+  ADAPTIVE_SYNC_LOAD_DELTA_THRESHOLD_PCT,
+  ADAPTIVE_SYNC_VELOCITY_DELTA_THRESHOLD,
+  ADAPTIVE_SYNC_JITTER_MS,
+} from '@cognitrack/shared';
 
 // ── Module-level singletons (set once in whenReady) ─────────────────────────────
 
@@ -150,7 +157,7 @@ app.whenReady().then(async () => {
   }
 
   // 14. Hourly batch: compute cognitive metrics and sync to Firestore
-  scheduleHourlyBatch();
+  scheduleAdaptiveBatch();
 
   // 15. If launched with --hidden (OS startup item), ensure popover stays closed
   if (process.argv.includes('--hidden')) {
@@ -329,20 +336,110 @@ function buildTrayMenu(): Menu {
   ]);
 }
 
-// ── Hourly batch scheduler ─────────────────────────────────────────────────────────────
+// ── Adaptive Batch Scheduler ─────────────────────────────────────────────────────────────
+// Runs cognitive batch with dynamic interval:
+// - Min interval: 15 min (prevents battery drain on laptops)
+// - Max interval: 60 min (ensures data freshness for cross-device merge)
+// - Triggers immediate sync if:
+//   * Cognitive load delta > 15% since last sync
+//   * Switch velocity peak delta > 2.0 switches/min since last sync
+// - Day rollover: always processes previous day at midnight boundary
 
-function scheduleHourlyBatch(): void {
-  const ONE_HOUR = 60 * 60 * 1000;
+function scheduleAdaptiveBatch(): void {
+  // Track last processed date for day rollover detection
+  let lastProcessedDate = getTodayDateString();
 
-  // Run immediately so today's partial data is available on startup
-  processBatch(store, syncEngine, userId, deviceId, mainWindow, tracker).catch(console.error);
+  // Track last synced metrics for adaptive triggering
+  let lastSyncedLoadPct = 0;
+  let lastSyncedVelocityPeak = 0;
+  let lastSyncedAt = Date.now();
 
-  // Then every hour with ±5-min jitter to avoid thundering-herd on shared Firestore
-  const jitter = Math.floor(Math.random() * 5 * 60 * 1000);
-  setInterval(() => {
-    processBatch(store, syncEngine, userId, deviceId, mainWindow, tracker).catch(console.error);
+  // Track current timer handle for dynamic rescheduling
+  let currentTimer: NodeJS.Timeout | null = null;
+
+  const scheduleNext = (intervalMs: number): void => {
+    if (currentTimer) clearTimeout(currentTimer);
+    const jitter = Math.floor(Math.random() * ADAPTIVE_SYNC_JITTER_MS);
+    currentTimer = setTimeout(runBatch, intervalMs + jitter);
+  };
+
+  const shouldTriggerImmediateSync = (currentLoadPct: number, currentVelocityPeak: number): boolean => {
+    const loadDelta = Math.abs(currentLoadPct - lastSyncedLoadPct);
+    const velocityDelta = Math.abs(currentVelocityPeak - lastSyncedVelocityPeak);
+    return loadDelta >= ADAPTIVE_SYNC_LOAD_DELTA_THRESHOLD_PCT ||
+           velocityDelta >= ADAPTIVE_SYNC_VELOCITY_DELTA_THRESHOLD;
+  };
+
+  const runBatch = async (): Promise<void> => {
+    const currentDate = getTodayDateString();
+
+    // DAY ROLLOVER: If date changed, process previous day first
+    if (currentDate !== lastProcessedDate) {
+      console.log(`[batch] Day rollover: ${lastProcessedDate} → ${currentDate}`);
+      await processBatch(store, syncEngine, userId, deviceId, mainWindow, tracker, lastProcessedDate)
+        .catch(console.error);
+      lastProcessedDate = currentDate;
+    }
+
+    // Process current day's batch
+    const result = await processBatch(store, syncEngine, userId, deviceId, mainWindow, tracker)
+      .catch(console.error);
+
+    // Update tray menu
     tray?.setContextMenu(buildTrayMenu());
-  }, ONE_HOUR + jitter);
+
+    // If batch returned metrics (non-empty day), check adaptive triggers
+    // processBatch doesn't return metrics directly, so we read from local store
+    try {
+      const metrics = store.getDailyMetrics(currentDate);
+      if (metrics && metrics.cognitiveLoadPct > 0) {
+        const loadDelta = Math.abs(metrics.cognitiveLoadPct - lastSyncedLoadPct);
+        const velocityDelta = Math.abs(metrics.switchVelocityPeak - lastSyncedVelocityPeak);
+
+        const triggered = loadDelta >= ADAPTIVE_SYNC_LOAD_DELTA_THRESHOLD_PCT ||
+                          velocityDelta >= ADAPTIVE_SYNC_VELOCITY_DELTA_THRESHOLD;
+
+        if (triggered) {
+          console.log(
+            `[adaptive-sync] Triggered: loadDelta=${loadDelta.toFixed(1)}% ` +
+            `(threshold=${ADAPTIVE_SYNC_LOAD_DELTA_THRESHOLD_PCT}%), ` +
+            `velocityDelta=${velocityDelta.toFixed(2)}/min ` +
+            `(threshold=${ADAPTIVE_SYNC_VELOCITY_DELTA_THRESHOLD})`
+          );
+          // Sync immediately by scheduling next run at min interval
+          lastSyncedLoadPct = metrics.cognitiveLoadPct;
+          lastSyncedVelocityPeak = metrics.switchVelocityPeak;
+          lastSyncedAt = Date.now();
+          scheduleNext(ADAPTIVE_SYNC_MIN_INTERVAL_MS);
+          return;
+        }
+      }
+    } catch (_) {
+      // Metrics not available yet, use time-based scheduling
+    }
+
+    // Time-based scheduling: interval scales with time since last sync
+    const timeSinceSync = Date.now() - lastSyncedAt;
+    let nextInterval: number;
+
+    if (timeSinceSync < ADAPTIVE_SYNC_MIN_INTERVAL_MS) {
+      nextInterval = ADAPTIVE_SYNC_MIN_INTERVAL_MS;
+    } else if (timeSinceSync > ADAPTIVE_SYNC_MAX_INTERVAL_MS) {
+      nextInterval = ADAPTIVE_SYNC_MAX_INTERVAL_MS;
+    } else {
+      // Linear interpolation between min and max based on time since sync
+      // As time passes, interval grows toward max
+      const ratio = timeSinceSync / ADAPTIVE_SYNC_MAX_INTERVAL_MS;
+      nextInterval = Math.round(
+        ADAPTIVE_SYNC_MIN_INTERVAL_MS + (ADAPTIVE_SYNC_MAX_INTERVAL_MS - ADAPTIVE_SYNC_MIN_INTERVAL_MS) * ratio
+      );
+    }
+
+    scheduleNext(nextInterval);
+  };
+
+  // Initial run on startup
+  runBatch().catch(console.error);
 }
 
 // ── Helper: wait for sign-in signal from renderer ──────────────────────────────────────

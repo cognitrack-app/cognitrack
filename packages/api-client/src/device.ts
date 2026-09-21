@@ -5,6 +5,8 @@ import {
   collection,
   getDocs,
   serverTimestamp,
+  runTransaction,
+  Transaction,
 } from 'firebase/firestore';
 import { db } from './firebase';
 import type { Platform } from '@cognitrack/shared';
@@ -22,7 +24,9 @@ export interface Device {
 
 /**
  * Upsert a device record under users/{userId}/devices/{deviceId}.
- * Uses merge:true so calling on every launch is safe.
+ * Uses a transaction to atomically check existence and set registeredAt only once.
+ * This prevents race conditions where concurrent launches could both see !exists
+ * and both write registeredAt, overwriting the original registration date.
  *
  * SECURITY: Firestore rules enforce request.auth.uid == userId,
  * so this path is protected — no other user can write to your devices.
@@ -37,29 +41,30 @@ export async function registerDevice(
   // ✔ Correct path: users/{userId}/devices/{deviceId}
   const ref = doc(db, 'users', userId, 'devices', deviceId);
 
-  // Read existing document FIRST.
-  // setDoc with merge:true does NOT protect fields from being overwritten —
-  // it only skips creating missing nested maps. Including registeredAt on every
-  // write would silently reset the original registration date each launch.
-  const existing = await getDoc(ref);
+  // Use transaction for atomic check-and-set (matches mobile implementation)
+  const deviceData = await runTransaction(db, async (transaction: Transaction) => {
+    const snapshot = await transaction.get(ref);
 
-  const base = {
-    deviceId,
-    userId,
-    platform,
-    displayName,
-    appVersion,
-    type: (platform === 'android' || platform === 'ios' ? 'mobile' : 'desktop') as Device['type'],
-    lastSeenAt: serverTimestamp(),
-  };
+    const base = {
+      deviceId,
+      userId,
+      platform,
+      displayName,
+      appVersion,
+      type: (platform === 'android' || platform === 'ios' ? 'mobile' : 'desktop') as Device['type'],
+      lastSeenAt: serverTimestamp(),
+    };
 
-  // Only set registeredAt when the document is being created for the first time.
-  const deviceData = existing.exists()
-    ? base
-    : { ...base, registeredAt: serverTimestamp() };
+    // Only set registeredAt when the document is being created for the first time.
+    const data = snapshot.exists()
+      ? base
+      : { ...base, registeredAt: serverTimestamp() };
 
-  await setDoc(ref, deviceData, { merge: true });
-  return deviceData as Device;
+    transaction.set(ref, data, { merge: true });
+    return data as Device;
+  });
+
+  return deviceData;
 }
 
 

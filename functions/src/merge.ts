@@ -5,18 +5,22 @@
  *
  * Pass 1 (cross-device merge): runs as soon as both phoneMetrics AND
  * desktopSessions are present. Writes combinedLoad, dualFragmentation,
- * phoneInterruptsDuringWork, combined switch fields back to the session doc.
+ * phoneHighLoadOverlapHours, combined switch fields back to the session doc.
+ *
+ * Multi-desktop aggregation: ALL desktops are weighted by totalFocusedTime
+ * (productive + tools hours). This preserves every desktop's switches,
+ * load profile, and category breakdown proportionally to actual usage.
  *
  * Pass 2 (derived metrics): after Pass 1 completes, fetches last 7 sessions
  * and UserConfig, runs computeDerivedDayMetrics, and writes the result to
  * /users/{uid}/derived/{date} — the single document the UI reads.
  *
- * Loop prevention: skips Pass 1 if lastMergeRun is already newer than both
- * agents' lastUpdated timestamps.
+ * Loop prevention: uses a transaction with idempotency token to prevent
+ * concurrent executions on the same session document.
  */
 
 import { onDocumentWritten } from 'firebase-functions/v2/firestore';
-import { getFirestore } from 'firebase-admin/firestore';
+import { getFirestore, FieldValue, Transaction, Timestamp } from 'firebase-admin/firestore';
 import { computeDualDeviceFragmentation } from '@cognitrack/shared';
 import type {
   DesktopSyncPayload,
@@ -25,6 +29,35 @@ import type {
   UserConfig,
 } from '@cognitrack/shared';
 import { computeDerivedDayMetrics } from './derivations';
+
+const HOURS_IN_DAY = 24;
+const REQUIRED_HOURLY_LOAD_LENGTH = 24;
+
+function validateHourlyLoad(hourlyLoad: number[] | undefined, source: string): number[] {
+  if (!hourlyLoad || !Array.isArray(hourlyLoad)) {
+    throw new Error(`${source}: hourlyLoad is missing or not an array`);
+  }
+  if (hourlyLoad.length !== REQUIRED_HOURLY_LOAD_LENGTH) {
+    throw new Error(`${source}: hourlyLoad has invalid length ${hourlyLoad.length}, expected ${REQUIRED_HOURLY_LOAD_LENGTH}`);
+  }
+  for (let i = 0; i < hourlyLoad.length; i++) {
+    const val = hourlyLoad[i];
+    if (typeof val !== 'number' || Number.isNaN(val)) {
+      throw new Error(`${source}: hourlyLoad[${i}] is not a valid number`);
+    }
+  }
+  return hourlyLoad;
+}
+
+function validateDesktopPayload(desktop: DesktopSyncPayload, deviceId: string): void {
+  validateHourlyLoad(desktop.hourlyLoad, `desktop ${deviceId}`);
+  if (typeof desktop.cognitiveLoadPct !== 'number' || Number.isNaN(desktop.cognitiveLoadPct)) {
+    throw new Error(`desktop ${deviceId}: cognitiveLoadPct is not a valid number`);
+  }
+  if (typeof desktop.totalFocusedTime !== 'number' || Number.isNaN(desktop.totalFocusedTime)) {
+    throw new Error(`desktop ${deviceId}: totalFocusedTime is not a valid number`);
+  }
+}
 
 export const mergeAgentData = onDocumentWritten(
   'users/{uid}/sessions/{date}',
@@ -58,6 +91,7 @@ export const mergeAgentData = onDocumentWritten(
     // PASS 1 ─ Cross-device merge
     // Requires BOTH phone AND at least one desktop to have reported.
     // Skips if we already merged after both agents' last updates.
+    // Uses a transaction with idempotency token to prevent race conditions.
     // ────────────────────────────────────────────────────────────────────────────
 
     const hasPhone = !!phone;
@@ -65,93 +99,114 @@ export const mergeAgentData = onDocumentWritten(
 
     if (hasPhone && hasDesktop) {
       const desktops = Object.values(desktopSessions!);
-      const primaryDesktop = desktops.reduce((best, d) =>
-        d.totalFocusedTime > best.totalFocusedTime ? d : best
-      );
 
-      // Loop prevention
-      if (lastMergeRun) {
-        const mergeTime   = new Date(lastMergeRun).getTime();
-        const phoneTime   = new Date(phone!.lastUpdated).getTime();
-        const desktopTime = new Date(primaryDesktop.lastUpdated).getTime();
-        if (mergeTime > phoneTime && mergeTime > desktopTime) {
-          // Already up to date — skip Pass 1 but still run Pass 2 to refresh derived doc
-          await runDerivedPass(db, uid, date, data, derivedRef);
-          return;
-        }
+      // Validate all payloads before processing
+      validateHourlyLoad(phone!.hourlyLoad, 'phone');
+      if (typeof phone!.cognitiveLoadPct !== 'number' || Number.isNaN(phone!.cognitiveLoadPct)) {
+        throw new Error('phone: cognitiveLoadPct is not a valid number');
+      }
+      for (const [deviceId, desktop] of Object.entries(desktopSessions!)) {
+        validateDesktopPayload(desktop, deviceId);
       }
 
-      // Fragmentation score
-      const fragReport = computeDualDeviceFragmentation({
-        phoneHourlyDebt:     phone!.hourlyLoad,
-        desktopHourlyDebt:   primaryDesktop.hourlyLoad,
-        phoneCategoryBreakdown:   phone!.categoryBreakdown,
-        desktopCategoryBreakdown: primaryDesktop.categoryBreakdown,
+      // Use a transaction for atomic read-compute-write with idempotency check
+      await db.runTransaction(async (transaction: Transaction) => {
+        const sessionDoc = await transaction.get(sessionRef);
+        if (!sessionDoc.exists) return;
+
+        const sessionData = sessionDoc.data() as SessionDocument;
+        const currentLastMergeRun = sessionData.lastMergeRun;
+
+        // Idempotency check: skip if lastMergeRun is newer than both agents' last updates
+        if (currentLastMergeRun) {
+          // Handle both string (legacy) and Timestamp (new) formats
+          const mergeTime = currentLastMergeRun instanceof Timestamp
+            ? currentLastMergeRun.toDate().getTime()
+            : new Date(currentLastMergeRun).getTime();
+          const phoneTime = new Date(phone!.lastUpdated).getTime();
+          const latestDesktopTime = Math.max(...desktops.map(d => new Date(d.lastUpdated).getTime()));
+          if (mergeTime > phoneTime && mergeTime > latestDesktopTime) {
+            // Already merged after both agents reported — skip Pass 1
+            return;
+          }
+        }
+
+        // ─── Weighted Multi-Desktop Aggregation ─────────────────────────────────────
+        // Weight each desktop by totalFocusedTime (productive + tools hours).
+        // This ensures a work laptop (6h focused) contributes more than a personal
+        // laptop (1h focused), while still preserving ALL switches and load data.
+        const weighted = aggregateDesktopsByFocusedTime(desktops);
+
+        // Fragmentation: phone vs. ALL desktops (weighted hourly load)
+        const fragReport = computeDualDeviceFragmentation({
+          phoneHourlyDebt:     phone!.hourlyLoad,
+          desktopHourlyDebt:   weighted.hourlyLoad,
+          phoneCategoryBreakdown:   phone!.categoryBreakdown,
+          desktopCategoryBreakdown: weighted.categoryBreakdown,
+        });
+
+        // Combined load: 55% phone + 45% weighted desktop aggregate
+        const combinedLoad = Math.min(100, Math.round(
+          phone!.cognitiveLoadPct * 0.55 + weighted.cognitiveLoadPct * 0.45
+        ));
+
+        // Phone high-load overlap hours: hours where ANY desktop >30% AND phone >20%
+        const phoneHighLoadOverlapHours = weighted.hourlyLoad.reduce(
+          (count, desktopLoad, hour) => {
+            const phoneLoad = phone!.hourlyLoad[hour];
+            return desktopLoad > 30 && phoneLoad > 20 ? count + 1 : count;
+          },
+          0
+        );
+
+        // Combined switches: phone + ALL desktops (every switch counts)
+        const combinedSwitchesTotal =
+          phone!.totalSwitches +
+          desktops.reduce((s, d) => s + d.totalSwitches, 0);
+
+        // Combined velocity peak: max across phone + ALL desktops
+        const combinedSwitchVelocityPeak = Math.max(
+          phone!.switchVelocityPeak,
+          ...desktops.map(d => d.switchVelocityPeak)
+        );
+
+        // Combined hourly load: element-wise max(phone, weightedDesktop)
+        const combinedHourlyLoad = Array.from({ length: HOURS_IN_DAY }, (_, i) =>
+          Math.max(
+            phone!.hourlyLoad[i],
+            weighted.hourlyLoad[i]
+          )
+        );
+
+        // Write merged fields with server timestamp for idempotency
+        const mergeRunTime = FieldValue.serverTimestamp();
+        transaction.update(sessionRef, {
+          combinedLoad,
+          dualFragmentation: fragReport.score,
+          phoneHighLoadOverlapHours,
+          combinedSwitchesTotal,
+          combinedSwitchVelocityPeak,
+          combinedHourlyLoad,
+          lastMergeRun: mergeRunTime,
+        });
+
+        // Refresh data snapshot with the merged fields before Pass 2
+        data.combinedLoad                = combinedLoad;
+        data.dualFragmentation            = fragReport.score;
+        data.phoneHighLoadOverlapHours    = phoneHighLoadOverlapHours;
+        data.combinedSwitchesTotal        = combinedSwitchesTotal;
+        data.combinedSwitchVelocityPeak   = combinedSwitchVelocityPeak;
+        data.combinedHourlyLoad           = combinedHourlyLoad;
+        data.lastMergeRun                 = new Date().toISOString(); // approximate for local use
+
+        console.log(
+          `✅ Merged ${date} for uid=${uid}: ` +
+          `combinedLoad=${combinedLoad}%, frag=${fragReport.score}, ` +
+          `phoneHighLoadOverlapHours=${phoneHighLoadOverlapHours}, ` +
+          `combinedSwitches=${combinedSwitchesTotal}, ` +
+          `desktops=${desktops.length} (weighted)`
+        );
       });
-
-      // Combined load: 55% phone + 45% primary desktop
-      const combinedLoad = Math.round(
-        phone!.cognitiveLoadPct * 0.55 + primaryDesktop.cognitiveLoadPct * 0.45
-      );
-
-      // CLOUD-04 FIX: This metric counts the number of HOURS in the day where
-      // both desktop load was > 30% AND phone load was > 20% simultaneously.
-      // This is NOT an interruption count — a user who checks their phone
-      // briefly 20 times in one hour still registers as 1 overlap hour, while
-      // a user who checks it once across 5 different work hours registers as 5.
-      // Renamed phoneHighLoadOverlapHours to accurately describe the metric.
-      // The UI should label this "Hours of concurrent phone & desktop load",
-      // not "Interruptions During Work".
-      const phoneHighLoadOverlapHours = primaryDesktop.hourlyLoad.reduce(
-        (count, desktopLoad, hour) => {
-          const phoneLoad = phone!.hourlyLoad[hour] ?? 0;
-          return desktopLoad > 30 && phoneLoad > 20 ? count + 1 : count;
-        },
-        0
-      );
-
-      // Combined switches: ALL devices summed
-      const combinedSwitchesTotal =
-        phone!.totalSwitches +
-        desktops.reduce((s, d) => s + d.totalSwitches, 0);
-
-      const combinedSwitchVelocityPeak = Math.max(
-        phone!.switchVelocityPeak,
-        ...desktops.map(d => d.switchVelocityPeak)
-      );
-
-      // Element-wise max hourly load across devices
-      const combinedHourlyLoad = Array.from({ length: 24 }, (_, i) =>
-        Math.max(
-          phone!.hourlyLoad[i] ?? 0,
-          ...desktops.map(d => d.hourlyLoad[i] ?? 0)
-        )
-      );
-
-      await sessionRef.update({
-        combinedLoad,
-        dualFragmentation: fragReport.score,
-        phoneHighLoadOverlapHours,   // CLOUD-04: renamed from phoneInterruptsDuringWork
-        combinedSwitchesTotal,
-        combinedSwitchVelocityPeak,
-        combinedHourlyLoad,
-        lastMergeRun: new Date().toISOString(),
-      });
-
-      // Refresh data snapshot with the merged fields before Pass 2
-      data.combinedLoad                = combinedLoad;
-      data.dualFragmentation            = fragReport.score;
-      data.phoneHighLoadOverlapHours    = phoneHighLoadOverlapHours; // CLOUD-04: renamed
-      data.combinedSwitchesTotal        = combinedSwitchesTotal;
-      data.combinedSwitchVelocityPeak   = combinedSwitchVelocityPeak;
-      data.combinedHourlyLoad           = combinedHourlyLoad;
-
-      console.log(
-        `✅ Merged ${date} for uid=${uid}: ` +
-        `combinedLoad=${combinedLoad}%, frag=${fragReport.score}, ` +
-        `phoneHighLoadOverlapHours=${phoneHighLoadOverlapHours}, ` +
-        `combinedSwitches=${combinedSwitchesTotal}`
-      );
     }
 
     // ────────────────────────────────────────────────────────────────────────────
@@ -172,16 +227,19 @@ async function runDerivedPass(
   derivedRef: FirebaseFirestore.DocumentReference
 ): Promise<void> {
   // Fetch last 7 session documents (descending — yesterday first)
+  // Use a larger limit to account for potential malformed dates, then filter client-side
   const last7Snap = await db
     .collection('users').doc(uid)
     .collection('sessions')
     .orderBy('date', 'desc')
-    .limit(8)
+    .limit(14) // Fetch extra to handle any malformed/missing dates
     .get();
 
-  const last7: SessionDocument[] = last7Snap.docs
+  const allSessions: SessionDocument[] = last7Snap.docs
     .map(d => d.data() as SessionDocument)
+    .filter(s => s.date && typeof s.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s.date))
     .filter(s => s.date !== date)  // exclude today
+    .sort((a, b) => b.date.localeCompare(a.date)) // ensure descending by date
     .slice(0, 7);
 
   // Fetch user config — fallback to sensible defaults if not yet written
@@ -205,7 +263,7 @@ async function runDerivedPass(
         last_calibrated_at: new Date().toISOString(),
       };
 
-  const derived = computeDerivedDayMetrics(today, last7, config);
+  const derived = computeDerivedDayMetrics(today, allSessions, config);
 
   await derivedRef.set(derived, { merge: true });
 
@@ -215,4 +273,71 @@ async function runDerivedPass(
     `combinedSwitches=${derived.context_switches_count_today}, ` +
     `syncStatus=${derived.data_sync_status}`
   );
+}
+
+// ─── Weighted Multi-Desktop Aggregation Helper ────────────────────────────────────
+// Aggregates all desktop payloads weighted by totalFocusedTime (productive + tools hours).
+// Returns a single "virtual desktop" payload representing the user's total desktop activity.
+interface AggregatedDesktop {
+  cognitiveLoadPct: number;
+  hourlyLoad: number[];
+  categoryBreakdown: {
+    productive: number;
+    tools: number;
+    social: number;
+    entertainment: number;
+    passiveWaste: number;
+  };
+}
+
+function aggregateDesktopsByFocusedTime(desktops: DesktopSyncPayload[]): AggregatedDesktop {
+  // Defensive: handle empty array (should not happen if called correctly, but guard anyway)
+  if (desktops.length === 0) {
+    // Return neutral aggregate — all zeros
+    return {
+      cognitiveLoadPct: 0,
+      hourlyLoad: Array(HOURS_IN_DAY).fill(0),
+      categoryBreakdown: {
+        productive: 0,
+        tools: 0,
+        social: 0,
+        entertainment: 0,
+        passiveWaste: 100,
+      },
+    };
+  }
+
+  // Calculate weights: totalFocusedTime per desktop
+  const weights = desktops.map(d => d.totalFocusedTime ?? 0);
+  const totalWeight = weights.reduce((sum, w) => sum + w, 0);
+
+  // Edge case: no focused time recorded (e.g., all desktops idle)
+  // Fall back to equal weighting
+  const normalizedWeights = totalWeight > 0
+    ? weights.map(w => w / totalWeight)
+    : weights.map(() => 1 / desktops.length);
+
+  // Weighted cognitive load
+  const cognitiveLoadPct = Math.round(
+    desktops.reduce((sum, d, i) => sum + d.cognitiveLoadPct * normalizedWeights[i], 0)
+  );
+
+  // Weighted hourly load (element-wise)
+  const hourlyLoad = Array.from({ length: HOURS_IN_DAY }, (_, h) =>
+    Math.round(desktops.reduce((sum, d, i) => sum + (d.hourlyLoad[h] ?? 0) * normalizedWeights[i], 0))
+  );
+
+  // Weighted category breakdown (5 categories)
+  const categoryKeys = ['productive', 'tools', 'social', 'entertainment', 'passiveWaste'] as const;
+  const categoryBreakdown = categoryKeys.reduce((acc, key) => {
+    const weightedSum = desktops.reduce((sum, d, i) => sum + (d.categoryBreakdown[key] ?? 0) * normalizedWeights[i], 0);
+    acc[key] = Math.round(weightedSum);
+    return acc;
+  }, {} as AggregatedDesktop['categoryBreakdown']);
+
+  // Ensure sum = 100 (floor 4, passiveWaste absorbs remainder)
+  const firstFourSum = categoryBreakdown.productive + categoryBreakdown.tools + categoryBreakdown.social + categoryBreakdown.entertainment;
+  categoryBreakdown.passiveWaste = Math.max(0, 100 - firstFourSum);
+
+  return { cognitiveLoadPct, hourlyLoad, categoryBreakdown };
 }
