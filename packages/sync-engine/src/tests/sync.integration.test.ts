@@ -6,10 +6,12 @@ import type { DesktopSyncPayload } from '@cognitrack/shared';
 // ─── Mock @cognitrack/api-client ───────────────────────────────────────────────
 vi.mock('@cognitrack/api-client', () => ({
   writeDesktopSession: vi.fn(),
+  readDesktopSession: vi.fn().mockResolvedValue(null),
 }));
 
 import { writeDesktopSession } from '@cognitrack/api-client';
 const mockWrite = writeDesktopSession as ReturnType<typeof vi.fn>;
+const mockRead = vi.fn().mockResolvedValue(null);
 
 // ─── Shared test fixture ────────────────────────────────────────────────────────
 const mockSession: DesktopSyncPayload = {
@@ -83,7 +85,11 @@ describe('SyncQueue', () => {
 
 // ─── SyncEngine integration tests ───────────────────────────────────────────────
 describe('SyncEngine', () => {
-  beforeEach(() => mockWrite.mockReset());
+  beforeEach(() => {
+    mockWrite.mockReset();
+    mockRead.mockReset();
+    mockRead.mockResolvedValue(null);
+  });
 
   it('push() enqueues while offline and does not call Firestore', () => {
     const engine = new SyncEngine(':memory:');
