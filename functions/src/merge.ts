@@ -20,7 +20,7 @@
  */
 
 import { onDocumentWritten } from 'firebase-functions/v2/firestore';
-import { getFirestore, FieldValue, Transaction, Timestamp } from 'firebase-admin/firestore';
+import { getFirestore, FieldValue, Transaction } from 'firebase-admin/firestore';
 import { computeDualDeviceFragmentation } from '@cognitrack/shared';
 import type {
   DesktopSyncPayload,
@@ -79,7 +79,6 @@ export const mergeAgentData = onDocumentWritten(
     const desktopSessions = data.desktopSessions as
       | Record<string, DesktopSyncPayload>
       | undefined;
-    const lastMergeRun = data.lastMergeRun;
 
     const uid = event.params.uid;
     const date = event.params.date;
@@ -120,8 +119,12 @@ export const mergeAgentData = onDocumentWritten(
         // Idempotency check: skip if lastMergeRun is newer than both agents' last updates
         if (currentLastMergeRun) {
           // Handle both string (legacy) and Timestamp (new) formats
-          const mergeTime = currentLastMergeRun instanceof Timestamp
-            ? currentLastMergeRun.toDate().getTime()
+          // Use duck typing since SessionDocument.lastMergeRun is typed as string | { toDate(): Date }
+          const isTimestamp = typeof currentLastMergeRun === 'object' &&
+                              currentLastMergeRun !== null &&
+                              'toDate' in currentLastMergeRun;
+          const mergeTime = isTimestamp
+            ? (currentLastMergeRun as { toDate(): Date }).toDate().getTime()
             : new Date(currentLastMergeRun).getTime();
           const phoneTime = new Date(phone!.lastUpdated).getTime();
           const latestDesktopTime = Math.max(...desktops.map(d => new Date(d.lastUpdated).getTime()));

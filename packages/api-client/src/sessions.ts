@@ -9,6 +9,7 @@ import {
   getDocs,
   onSnapshot,
   serverTimestamp,
+  Timestamp,
 } from 'firebase/firestore';
 import { db } from './firebase';
 import type { DesktopSyncPayload, PhoneSyncPayload, SessionDocument } from '@cognitrack/shared';
