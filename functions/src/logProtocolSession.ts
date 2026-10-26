@@ -27,7 +27,7 @@ interface LogProtocolSessionRequest {
 }
 
 export const logProtocolSession = onCall(
-  { enforceAppCheck: false },
+  { region: 'us-central1', enforceAppCheck: true },
   async (request) => {
     const uid = request.auth?.uid;
     if (!uid) throw new HttpsError('unauthenticated', 'Must be signed in.');

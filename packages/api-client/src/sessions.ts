@@ -9,6 +9,7 @@ import {
   getDocs,
   onSnapshot,
   serverTimestamp,
+  Timestamp,
 } from 'firebase/firestore';
 import { db } from './firebase';
 import type { DesktopSyncPayload, PhoneSyncPayload, SessionDocument } from '@cognitrack/shared';
@@ -52,7 +53,7 @@ export async function writeDesktopSession(
       date,
       deletedAt: null,
       updatedAt: serverTimestamp(),
-      [`desktopSessions.${deviceId}`]: payload,
+      desktopSessions: { [deviceId]: payload },
     },
     { merge: true },
   );

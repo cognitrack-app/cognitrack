@@ -6,6 +6,8 @@
  *
  * Called from mergeAgentData (real-time) and weeklyRollup (batch).
  * No Firestore imports here — this is pure computation.
+ *
+ * ENG-11: Accepts optional cached context parameter for runDerivedPass caching.
  */
 
 import type {
@@ -48,14 +50,77 @@ function hourlySum(a: number[], b: number[]): number[] {
   );
 }
 
-// ─── Main Derivation Function ──────────────────────────────────────────────────
+// ─── Cache Types (ENG-11) ─────────────────────────────────────────────────────────
+// Minimal session shape stored in cache — only fields actually used by derivations.
+// This avoids requiring all SessionDocument fields (platform, userId, etc.) in cache.
+
+export interface CachedSession {
+  date: string;
+  phoneMetrics?: {
+    hourlyLoad: number[];
+    cognitiveLoadPct: number;
+    cognitiveDebt?: number;  // Optional - cache may not store raw debt
+    residueAtEOD: number;
+    totalSwitches: number;
+    switchVelocityPeak: number;
+    totalScreenTime: number;
+    totalPickups: number;
+    peakLoadHour: number;
+    categoryBreakdown: {
+      productive: number;
+      tools: number;
+      social: number;
+      entertainment: number;
+      passiveWaste: number;
+    };
+    break_events: BreakEvent[];
+  };
+  desktopSessions?: Record<string, {
+    hourlyLoad: number[];
+    cognitiveLoadPct: number;
+    cognitiveDebt?: number;  // Optional - cache may not store raw debt
+    categoryBreakdown: {
+      productive: number;
+      tools: number;
+      social: number;
+      entertainment: number;
+      passiveWaste: number;
+    };
+    break_events: BreakEvent[];
+    totalSwitches: number;
+    switchVelocityPeak: number;
+    residueAtEOD: number;
+    totalFocusedTime: number;
+    peakLoadHour: number;
+  }>;
+  combinedLoad?: number;
+  combinedHourlyLoad?: number[];
+  carryover_debt_pts?: number;
+  carryover_residue?: number;
+}
+
+export interface CachedContext {
+  last7: CachedSession[];
+  config: UserConfig;
+}
 
 export function computeDerivedDayMetrics(
   today: SessionDocument,
   /** Last 7 days in DESCENDING order (index 0 = yesterday, index 6 = 7 days ago) */
   last7: SessionDocument[],
-  config: UserConfig
+  config: UserConfig,
+  /** Optional cached context from cache.ts for performance (ENG-11) */
+  cachedContext?: CachedContext
 ): DerivedDayMetrics {
+  // Determine which sessions to use: cached or fresh
+  // Use a local variable to avoid type issues (CachedSession[] vs SessionDocument[])
+  const sessionsToUse: SessionDocument[] = (cachedContext && isCacheValidForContext(cachedContext, last7))
+    ? (cachedContext.last7 as unknown as SessionDocument[])
+    : last7;
+  const configToUse = (cachedContext && isCacheValidForContext(cachedContext, last7))
+    ? cachedContext.config
+    : config;
+
   const p = today.phoneMetrics;
   const desktops = Object.values(today.desktopSessions ?? {});
 
@@ -87,8 +152,8 @@ export function computeDerivedDayMetrics(
   // Hourly switch velocity: sum phone + desktop per hour, normalised to switches/hr
   // phoneHourly and desktopHourly are 0–100 load% — convert to est. switches/hr
   // using: switches/hr = (load% / 100) * critical_threshold
-  const critThreshold = config.switch_critical_threshold ?? 80;
-  const baseline = config.switch_baseline ?? 40;
+  const critThreshold = configToUse.switch_critical_threshold ?? 80;
+  const baseline = configToUse.switch_baseline ?? 40;
 
   const phoneVelocityHourly = phoneHourly.map(l => Math.round((l / 100) * critThreshold * 1.2));
   const desktopVelocityHourly = desktopHourly.map(l => Math.round((l / 100) * critThreshold * 0.8));
@@ -130,7 +195,7 @@ export function computeDerivedDayMetrics(
   while (history6h.length < 6) history6h.unshift(0);
 
   // WoW change vs same weekday 7 sessions ago
-  const sameLastWeekDebt = last7[6]?.combinedLoad ?? last7[6]?.phoneMetrics?.cognitiveLoadPct ?? debtScore;
+  const sameLastWeekDebt = sessionsToUse[6]?.combinedLoad ?? sessionsToUse[6]?.phoneMetrics?.cognitiveLoadPct ?? debtScore;
   const wowDebt = sameLastWeekDebt === 0 ? 0
     : Math.round(((debtScore - sameLastWeekDebt) / sameLastWeekDebt) * 100);
 
@@ -151,13 +216,13 @@ export function computeDerivedDayMetrics(
 
   // ── Screen Time ────────────────────────────────────────────────────────────
   const screenTimeHours = p?.totalScreenTime ?? 0;
-  const yesterdayST = last7[0]?.phoneMetrics?.totalScreenTime ?? screenTimeHours;
+  const yesterdayST = sessionsToUse[0]?.phoneMetrics?.totalScreenTime ?? screenTimeHours;
   const stPctChange = yesterdayST === 0 ? 0
     : Math.round(((screenTimeHours - yesterdayST) / yesterdayST) * 100);
 
   // ── Device Pickups ─────────────────────────────────────────────────────────
   const pickups = p?.totalPickups ?? 0;
-  const last7Pickups = last7.map(s => s.phoneMetrics?.totalPickups ?? 0);
+  const last7Pickups = sessionsToUse.map(s => s.phoneMetrics?.totalPickups ?? 0);
   const avgPickups = avgArr(last7Pickups);
   const pickupsVsAvg =
     pickups < avgPickups * 0.8 ? 'Below avg'
@@ -181,7 +246,7 @@ export function computeDerivedDayMetrics(
     : blendedResiduePct >= 20 ? 'MODERATE'
     : 'LOW';
 
-  const residueTrend7d = last7.map(s => {
+  const residueTrend7d = sessionsToUse.map(s => {
     const pr = s.phoneMetrics?.residueAtEOD ?? 0;
     const dr = Object.values(s.desktopSessions ?? {}).reduce(
       (mx, d) => Math.max(mx, d.residueAtEOD), 0
@@ -221,7 +286,7 @@ export function computeDerivedDayMetrics(
     : 0;
   const totalFocusMin = phoneFocusMin + desktopFocusMin;
 
-  const last7FocusMin = last7.map(s => {
+  const last7FocusMin = sessionsToUse.map(s => {
     const pp = s.phoneMetrics;
     const dd = Object.values(s.desktopSessions ?? {}).reduce(
       (mx, d) => Math.max(mx, d.totalFocusedTime), 0
@@ -235,7 +300,7 @@ export function computeDerivedDayMetrics(
     : Math.round(((totalFocusMin - avgLast7DaysFocus) / avgLast7DaysFocus) * 100);
 
   // ── Stress Peak ────────────────────────────────────────────────────────────
-  const last7PeakHours = last7.map(s => s.phoneMetrics?.peakLoadHour ?? 12);
+  const last7PeakHours = sessionsToUse.map(s => s.phoneMetrics?.peakLoadHour ?? 12);
   const avgPeakHour = Math.round(avgArr(last7PeakHours));
   const peakVsAvg =
     peakHour > avgPeakHour + 1 ? 'Later than avg'
@@ -267,7 +332,7 @@ export function computeDerivedDayMetrics(
   };
 
   // Recovery WoW label — compares against last 7 sessions' verified break minutes
-  const last7RecoveryMin = last7.map(s => {
+  const last7RecoveryMin = sessionsToUse.map(s => {
     const phoneB = s.phoneMetrics?.break_events ?? [];
     const desktopB = Object.values(s.desktopSessions ?? {}).flatMap(d => d.break_events ?? []);
     const verified = [...phoneB, ...desktopB]
@@ -335,14 +400,14 @@ export function computeDerivedDayMetrics(
     }
   }
 
-  const netPtsDelta = debtPointsWithCarryover - (last7[0] != null
-    ? Math.round((last7[0].phoneMetrics?.cognitiveDebt ?? 0) +
-        Object.values(last7[0].desktopSessions ?? {}).reduce((s, d) => s + d.cognitiveDebt, 0) * 0.45)
+  const netPtsDelta = debtPointsWithCarryover - (sessionsToUse[0] != null
+    ? Math.round((sessionsToUse[0].phoneMetrics?.cognitiveDebt ?? 0) +
+        Object.values(sessionsToUse[0].desktopSessions ?? {}).reduce((s, d) => s + d.cognitiveDebt, 0) * 0.45)
     : 0);
 
   // ── Heatmap [7][24] ────────────────────────────────────────────────────────
   // Build from combined hourly loads across last 7 sessions
-  const heatmapWeekly: number[][] = last7
+  const heatmapWeekly: number[][] = sessionsToUse
     .slice(0, 7)
     .map(s => {
       const ph = s.phoneMetrics?.hourlyLoad ?? Array(24).fill(0);
@@ -357,7 +422,7 @@ export function computeDerivedDayMetrics(
   while (heatmapWeekly.length < 7) heatmapWeekly.unshift(Array(24).fill(0));
 
   // ── Recovery Radar (5 axes, 0–1) ─────────────────────────────────────────
-  const sleepTarget = config.sleep_target_hours ?? 7.5;
+  const sleepTarget = configToUse.sleep_target_hours ?? 7.5;
   const radarSleep = clamp(recoveryHours / sleepTarget, 0, 1);
   const radarFocus = clamp(totalFocusMin / 240, 0, 1);      // 4h = perfect
   const radarWmStrain = 1 - (wmStrain / 100);               // inverted
@@ -408,7 +473,7 @@ export function computeDerivedDayMetrics(
   // ── Data Completeness ──────────────────────────────────────────────────────
   // Always divide by 7 (not last7.length) - new users on Day 2 should
   // show 14% completeness, not a misleading 100%.
-  const sessionsWithRealData = last7.filter(s =>
+  const sessionsWithRealData = sessionsToUse.filter(s =>
     (s.phoneMetrics?.totalSwitches ?? 0) > 0 ||
     Object.keys(s.desktopSessions ?? {}).length > 0
   ).length;
@@ -423,7 +488,7 @@ export function computeDerivedDayMetrics(
 
   // ── Weekly Load Index ──────────────────────────────────────────────────────
   const weeklyLoads = [
-    ...last7.map(s => s.combinedLoad ?? s.phoneMetrics?.cognitiveLoadPct ?? 0).reverse(),
+    ...sessionsToUse.map(s => s.combinedLoad ?? s.phoneMetrics?.cognitiveLoadPct ?? 0).reverse(),
     debtScore,
   ].slice(-7);
   while (weeklyLoads.length < 7) weeklyLoads.unshift(0);
@@ -464,7 +529,7 @@ export function computeDerivedDayMetrics(
     screen_time_hours_today: screenTimeHours,
     screen_time_pct_change_vs_yesterday: stPctChange,
     screen_time_category_breakdown: p?.categoryBreakdown ?? {
-      productive: 0, entertainment: 0, social: 0, passiveWaste: 0,
+      productive: 0, tools: 0, entertainment: 0, social: 0, passiveWaste: 0,
     },
 
     device_pickups_count_today: pickups,
@@ -537,4 +602,21 @@ export function computeDerivedDayMetrics(
 
     computed_at: new Date().toISOString(),
   };
+}
+
+/**
+ * Checks if cached context is still valid for the current session list.
+ * Used by computeDerivedDayMetrics when optional cachedContext is provided.
+ */
+export function isCacheValidForContext(
+  cached: CachedContext,
+  currentLast7: SessionDocument[]
+): boolean {
+  if (currentLast7.length === 0) return true;
+  if (cached.last7.length !== currentLast7.length) return false;
+
+  // Check if the oldest session date matches (cache was built from same data)
+  const cachedOldest = cached.last7[cached.last7.length - 1]?.date;
+  const currentOldest = currentLast7[currentLast7.length - 1]?.date;
+  return cachedOldest === currentOldest;
 }

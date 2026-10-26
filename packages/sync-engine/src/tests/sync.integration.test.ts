@@ -1,20 +1,32 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import Database from 'better-sqlite3';
 import { SyncEngine } from '../sync';
-import { SyncQueue } from '../queue';
 import type { DesktopSyncPayload } from '@cognitrack/shared';
 
 // ─── Mock @cognitrack/api-client ───────────────────────────────────────────────
 vi.mock('@cognitrack/api-client', () => ({
   writeDesktopSession: vi.fn(),
+  readDesktopSession: vi.fn().mockResolvedValue(null),
 }));
 
 import { writeDesktopSession } from '@cognitrack/api-client';
 const mockWrite = writeDesktopSession as ReturnType<typeof vi.fn>;
+const mockRead = vi.fn().mockResolvedValue(null);
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function makeDb(): Database.Database {
+  return new Database(':memory:');
+}
+
+function setupQueue(db: Database.Database): void {
+  db.exec(`CREATE TABLE IF NOT EXISTS sync_queue (user_id TEXT NOT NULL, date TEXT NOT NULL, payload_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', retry_count INTEGER NOT NULL DEFAULT 0, next_retry_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (user_id, date))`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_sync_queue_status_next_retry ON sync_queue(status, next_retry_at)`);
+}
 
 // ─── Shared test fixture ────────────────────────────────────────────────────────
 const mockSession: DesktopSyncPayload = {
   deviceId:            'device-test-001',
-  agentType:           'desktop',
   platform:            'win32',
   cognitiveDebt:       120,
   cognitiveLoadPct:    45,
@@ -29,133 +41,147 @@ const mockSession: DesktopSyncPayload = {
   break_events:        [],
   lastUpdated:         '2026-04-19T10:00:00.000Z',
   schemaVersion:       2,
+  date: '2026-04-19',
+  timezone: 'UTC',
+  hourlySwitches: Array(24).fill(0),
+  totalTimeMs: 0,
 };
 
-const BASE = { type: 'desktopSession' as const, status: 'pending' as const, attempts: 0 };
-const makeData = (deviceId = 'd1') => ({ userId: 'u1', date: '2026-04-19', deviceId, session: mockSession });
-
-// ─── SyncQueue unit tests ────────────────────────────────────────────────────────
-describe('SyncQueue', () => {
-  it('enqueues an item with pending status', () => {
-    const q  = new SyncQueue(':memory:');
-    const id = q.addItem({ ...BASE,  data: makeData() });
-    expect(q.getPendingItems()).toHaveLength(1);
-    expect(id).toBeTruthy();
-    expect(q.getStatus().pending).toBe(1);
-  });
-
-  it('updateItemStatus synced → removes from pending', () => {
-    const q  = new SyncQueue(':memory:');
-    const id = q.addItem({ ...BASE,  data: makeData() });
-    q.updateItemStatus(id, 'synced');
-    expect(q.getPendingItems()).toHaveLength(0);
-    expect(q.getStatus().synced).toBe(1);
-  });
-
-  it('updateItemStatus failed → increments attempts', () => {
-    const q  = new SyncQueue(':memory:');
-    const id = q.addItem({ ...BASE,  data: makeData() });
-    q.updateItemStatus(id, 'failed', 'network error');
-    expect(q.getStatus().failed).toBe(1);
-    expect(q.getItem(id)?.attempts).toBe(1);
-  });
-
-  it('requeueFailed resets failed items under retry limit back to pending', () => {
-    const q  = new SyncQueue(':memory:');
-    const id = q.addItem({ ...BASE,  data: makeData() });
-    q.updateItemStatus(id, 'failed', 'err');
-    q.requeueFailed();
-    expect(q.getPendingItems()).toHaveLength(1);
-    expect(q.getStatus().failed).toBe(0);
-  });
-
-  it('getStatus returns accurate aggregate counts', () => {
-    const q   = new SyncQueue(':memory:');
-    const id1 = q.addItem({ ...BASE,  data: makeData('d1') });
-    const id2 = q.addItem({ ...BASE,  data: makeData('d2') });
-    q.updateItemStatus(id2, 'synced');
-    const s = q.getStatus();
-    expect(s.pending).toBe(1);
-    expect(s.synced).toBe(1);
-    expect(s.total).toBe(2);
-  });
+const makePayload = (deviceId = 'd1') => ({
+  userId: 'u1',
+  date: '2026-04-19',
+  deviceId,
+  session: mockSession,
 });
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function qStats(db: Database.Database): { pending: number; syncing: number; synced: number; failed: number } {
+  const stmt = db.prepare('SELECT status, COUNT(*) as count FROM sync_queue GROUP BY status');
+  const rows = stmt.all() as { status: string; count: number }[];
+  const stats = { pending: 0, syncing: 0, synced: 0, failed: 0 };
+  for (const row of rows) {
+    stats[row.status as keyof typeof stats] = row.count;
+  }
+  return stats;
+}
 
 // ─── SyncEngine integration tests ───────────────────────────────────────────────
 describe('SyncEngine', () => {
-  beforeEach(() => mockWrite.mockReset());
+  let db: Database.Database;
+  let writeSessionFn: (userId: string, date: string, deviceId: string, session: any) => Promise<void>;
 
-  it('push() enqueues while offline and does not call Firestore', () => {
-    const engine = new SyncEngine(':memory:');
+  beforeEach(() => {
+    mockWrite.mockReset();
+    mockRead.mockReset();
+    mockRead.mockResolvedValue(null);
+
+    db = makeDb();
+    setupQueue(db);
+    writeSessionFn = async (userId, date, deviceId, session) => {
+      await mockWrite(userId, date, deviceId, session);
+    };
+  });
+
+  it('push() enqueues while offline and does not call Firestore', async () => {
+    const engine = new SyncEngine({
+      db,
+      writeSessionFn,
+      getOnlineStatus: () => false,
+      onOnlineChange: () => () => {},
+    });
     engine.setOnline(false);
     engine.push('u1', '2026-04-19', 'd1', mockSession);
-    expect(engine.getQueueStatus().pending).toBe(1);
+
+    const stats = qStats(db);
+    expect(stats.pending).toBe(1);
     expect(mockWrite).not.toHaveBeenCalled();
   });
 
   it('flush() syncs pending → synced and calls writeDesktopSession', async () => {
     mockWrite.mockResolvedValue(undefined);
-    const engine = new SyncEngine(':memory:');
+    const engine = new SyncEngine({
+      db,
+      writeSessionFn,
+      getOnlineStatus: () => true,
+      onOnlineChange: () => () => {},
+    });
     engine.push('u1', '2026-04-19', 'd1', mockSession);
-    (engine as any).isOnline = true;
     await engine.flush();
-    const status = engine.getQueueStatus();
-    expect(status.synced).toBe(1);
-    expect(status.pending).toBe(0);
+
+    const stats = qStats(db);
+    expect(stats.synced).toBe(1);
+    expect(stats.pending).toBe(0);
     expect(mockWrite).toHaveBeenCalledOnce();
     expect(mockWrite).toHaveBeenCalledWith('u1', '2026-04-19', 'd1', mockSession);
   });
 
   it('flush() marks item failed on network error and preserves message', async () => {
-    // Disable vitest's unhandled rejection detection for this test.
-    // The implementation properly catches the error, but vitest's global
-    // unhandledRejection handler fires before the catch handler runs.
-    // This is a vitest limitation, not a bug in the implementation.
     const originalHandlers = process.listeners('unhandledRejection');
     process.removeAllListeners('unhandledRejection');
 
     mockWrite.mockImplementation(() => Promise.reject(new Error('Network error')));
-    const engine = new SyncEngine(':memory:');
+    const engine = new SyncEngine({
+      db,
+      writeSessionFn,
+      getOnlineStatus: () => true,
+      onOnlineChange: () => () => {},
+    });
     engine.push('u1', '2026-04-19', 'd1', mockSession);
-    (engine as any).isOnline = true;
     await engine.flush();
 
-    // Restore handlers
     for (const h of originalHandlers) process.on('unhandledRejection', h);
 
-    const status = engine.getQueueStatus();
-    expect(status.failed).toBe(1);
-    expect(status.synced).toBe(0);
+    const stats = qStats(db);
+    // After 1 failure, row stays pending with backoff (maxRetries=20 before 'failed')
+    expect(stats.pending).toBe(1);
+    expect(stats.failed).toBe(0);
+    expect(stats.synced).toBe(0);
   });
 
   it('flush() is a no-op when offline', async () => {
-    const engine = new SyncEngine(':memory:');
+    const engine = new SyncEngine({
+      db,
+      writeSessionFn,
+      getOnlineStatus: () => false,
+      onOnlineChange: () => () => {},
+    });
     engine.push('u1', '2026-04-19', 'd1', mockSession);
-    engine.setOnline(false);
     await engine.flush();
-    expect(engine.getQueueStatus().pending).toBe(1);
+
+    const stats = qStats(db);
+    expect(stats.pending).toBe(1);
     expect(mockWrite).not.toHaveBeenCalled();
   });
 
-  it('resolveConflict returns the payload with the newer lastUpdated', () => {
-    const engine = new SyncEngine(':memory:');
-    const older  = { ...mockSession, lastUpdated: '2026-04-19T08:00:00.000Z', cognitiveLoadPct: 30 };
-    const newer  = { ...mockSession, lastUpdated: '2026-04-19T12:00:00.000Z', cognitiveLoadPct: 70 };
-    expect(engine.resolveConflict(older, newer).cognitiveLoadPct).toBe(70);
-    expect(engine.resolveConflict(newer, older).cognitiveLoadPct).toBe(70);
+  it('resolveConflict calls writeSessionFn', () => {
+    const engine = new SyncEngine({
+      db,
+      writeSessionFn,
+      getOnlineStatus: () => true,
+      onOnlineChange: () => () => {},
+    });
+    engine.resolveConflict('u1', '2026-04-19', 'd1', mockSession);
+    expect(mockWrite).toHaveBeenCalledWith('u1', '2026-04-19', 'd1', mockSession);
   });
 
   it('flush() syncs multiple items and reports all as synced', async () => {
     mockWrite.mockResolvedValue(undefined);
-    const engine = new SyncEngine(':memory:');
+    const engine = new SyncEngine({
+      db,
+      writeSessionFn,
+      getOnlineStatus: () => true,
+      onOnlineChange: () => () => {},
+    });
+    // With deduplication (one row per user+date), use different dates for distinct items
     engine.push('u1', '2026-04-19', 'd1', mockSession);
-    engine.push('u1', '2026-04-19', 'd2', mockSession);
-    engine.push('u1', '2026-04-19', 'd3', mockSession);
-    (engine as any).isOnline = true;
+    engine.push('u1', '2026-04-20', 'd2', mockSession);
+    engine.push('u1', '2026-04-21', 'd3', mockSession);
     await engine.flush();
-    const status = engine.getQueueStatus();
-    expect(status.synced).toBe(3);
-    expect(status.pending).toBe(0);
+
+    const stats = qStats(db);
+    expect(stats.synced).toBe(3);
+    expect(stats.pending).toBe(0);
     expect(mockWrite).toHaveBeenCalledTimes(3);
   });
 });

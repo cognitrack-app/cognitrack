@@ -2,10 +2,94 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    // ── Helper: validate exact session document fields (ENG-05, S1) ─────────────
+    // Used ONLY by devices/{deviceId} subcollection writes.
+    // Firestore rules functions: single return, no early returns, no lambdas.
+    function isValidSessionData(data) {
+      let allowedKeys = [
+        'userId',
+        'deviceId',
+        'date',
+        'timezone',
+        'hourlyLoad',
+        'hourlySwitches',
+        'totalTimeMs',
+        'totalSwitches',
+        'categoryBreakdown',
+        'updatedAt'
+      ];
+      return data.keys().hasOnly(allowedKeys)
+        && ('userId' in data) && (data.userId is string)
+        && ('deviceId' in data) && (data.deviceId is string)
+        && ('date' in data) && (data.date is string)
+        && (!('timezone' in data) || (data.timezone is string))
+        && ('hourlyLoad' in data) && (data.hourlyLoad is list) && (data.hourlyLoad.size() == 24)
+        && ('hourlySwitches' in data) && (data.hourlySwitches is list) && (data.hourlySwitches.size() == 24)
+        && ('totalTimeMs' in data) && (data.totalTimeMs is number) && (data.totalTimeMs >= 0)
+        && ('totalSwitches' in data) && (data.totalSwitches is number) && (data.totalSwitches >= 0)
+        && ('categoryBreakdown' in data) && (data.categoryBreakdown is map)
+        && ('updatedAt' in data) && (data.updatedAt is timestamp);
+    }
+
     // ── Sessions: agents (phone + desktop) write here ────────────────────────
     // Clients may also read their own sessions for historical display.
     match /users/{uid}/sessions/{date} {
-      allow read, write: if request.auth != null && request.auth.uid == uid;
+      allow read: if request.auth != null && request.auth.uid == uid;
+
+      // Create: phoneMetrics, desktopSessions, deletedAt, updatedAt
+      allow create: if request.auth != null
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly([
+          'userId', 'deviceId', 'date', 'timezone',
+          'phoneMetrics', 'desktopSessions',
+          'deletedAt', 'updatedAt'
+        ])
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.date == date
+        && (!('phoneMetrics' in request.resource.data)
+            || request.resource.data.phoneMetrics is map)
+        && (!('desktopSessions' in request.resource.data)
+            || request.resource.data.desktopSessions is map);
+
+      // Update: only allow changes to cloud-write fields and specific client fields
+      allow update: if request.auth != null
+        && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'userId', 'deviceId', 'date', 'timezone',
+          'phoneMetrics', 'desktopSessions',
+          'deletedAt', 'updatedAt',
+          // Cloud-write fields written by mergeAgentData Cloud Function
+          'combinedLoad',
+          'dualFragmentation',
+          'phoneHighLoadOverlapHours',
+          'combinedSwitchesTotal',
+          'combinedSwitchVelocityPeak',
+          'combinedHourlyLoad',
+          'lastMergeRun',
+          'devicesProcessed',
+          'devicesSkipped',
+          'mergeErrors',
+        ])
+        && (!('phoneMetrics' in request.resource.data)
+            || request.resource.data.phoneMetrics is map)
+        && (!('desktopSessions' in request.resource.data)
+            || request.resource.data.desktopSessions is map);
+
+      // Deletes are explicitly denied (request.resource is null on delete)
+      allow delete: if false;
+
+      // Devices write to their own subcollection under the session
+      match /devices/{deviceId} {
+        // Reads don't write a document, so no field validation — just auth check
+        allow read: if request.auth != null && request.auth.uid == uid;
+
+        // Writes go through full validation
+        allow create, update: if request.auth != null
+          && request.auth.uid == uid
+          && isValidSessionData(request.resource.data);
+
+        allow delete: if false;
+      }
     }
 
     // ── Devices: agents register here on first launch ────────────────────────
@@ -23,6 +107,12 @@ service cloud.firestore {
       allow read, write: if request.auth != null && request.auth.uid == uid;
     }
 
+    // ── Cache: client read-only (written by Cloud Functions) ─────────────────
+    match /users/{uid}/cache/{doc} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+      allow write: if false; // only Admin SDK
+    }
+
     // ── Weekly reports: Cloud Function only, client read-only ────────────────
     match /users/{uid}/weeklyReports/{weekId} {
       allow read:  if request.auth != null && request.auth.uid == uid;
@@ -30,13 +120,21 @@ service cloud.firestore {
     }
 
     // ── DERIVED: Cloud Function output — client READ-ONLY ───────────────────
-    // MEDIUM-1 FIX: The previous wildcard /users/{uid}/{document=**} allowed
-    // clients to overwrite derived/{date}, which is written exclusively by the
-    // mergeAgentData Cloud Function (Admin SDK). A buggy or malicious client
-    // could corrupt the entire dashboard by writing garbage here.
     match /users/{uid}/derived/{date} {
       allow read:  if request.auth != null && request.auth.uid == uid;
       allow write: if false; // only Admin SDK (mergeAgentData / weeklyRollup)
+    }
+
+    // ── COMBINED DAYS: Server-only collection (merged data) ──────────────────
+    match /users/{uid}/combinedDays/{date} {
+      allow read:  if request.auth != null && request.auth.uid == uid;
+      allow write: if false; // only Admin SDK
+    }
+
+    // ── ROLLUPS: Server-only collections ──────────────────────────────────────
+    match /users/{uid}/rollups/{doc} {
+      allow read:  if request.auth != null && request.auth.uid == uid;
+      allow write: if false; // only Admin SDK
     }
 
     // ── Protocols: any authenticated user reads, no client writes ────────────

@@ -3,7 +3,7 @@ import type { CategoryBreakdown, DesktopCategoryBreakdown } from '../src/types';
 
 // ─ Zero-value fixtures ───────────────────────────────────────────────────────
 const ZERO_HOURLY = Array<number>(24).fill(0);
-const ZERO_CAT: CategoryBreakdown = { productive: 0, entertainment: 0, social: 0, passiveWaste: 0 };
+const ZERO_CAT: CategoryBreakdown = { productive: 0, tools: 0, entertainment: 0, social: 0, passiveWaste: 0 };
 const ZERO_DESKTOP_CAT: DesktopCategoryBreakdown = { ...ZERO_CAT, tools: 0 };
 
 function makeInput(

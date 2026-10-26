@@ -13,6 +13,7 @@ export function computeCategoryBreakdown(
   if (totalDuration === 0) {
     return {
       productive: 0,
+      tools: 0,
       entertainment: 0,
       social: 0,
       passiveWaste: 0,
@@ -22,15 +23,17 @@ export function computeCategoryBreakdown(
   const rawPct = (ms: number) => (ms / totalDuration) * 100;
 
   const _productive = Math.floor(rawPct(durationByCategory['productive'] ?? 0));
+  const _tools = Math.floor(rawPct(durationByCategory['tools'] ?? 0));
   const _entertainment = Math.floor(rawPct(durationByCategory['entertainment'] ?? 0));
   const _social = Math.floor(rawPct(durationByCategory['social'] ?? 0));
   const _passiveWaste = Math.floor(rawPct(durationByCategory['passiveWaste'] ?? 0));
 
   return {
     productive: _productive,
+    tools: _tools,
     entertainment: _entertainment,
     social: _social,
-    passiveWaste: 100 - _productive - _entertainment - _social - _passiveWaste,
+    passiveWaste: 100 - _productive - _tools - _entertainment - _social - _passiveWaste,
   };
 }
 

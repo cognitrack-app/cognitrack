@@ -21,9 +21,10 @@ import type {
   WeeklyReport,
 } from '@cognitrack/shared';
 import { computeDerivedDayMetrics } from './derivations';
+import { invalidateDerivedCache } from './cache';
 
 export const weeklyRollup = onSchedule(
-  { schedule: '0 3 * * 1', timeZone: 'Europe/Copenhagen' },
+  { schedule: '0 3 * * 1', timeZone: 'Europe/Copenhagen', region: 'us-central1' },
   async () => {
     const db = getFirestore();
 
@@ -41,218 +42,221 @@ export const weeklyRollup = onSchedule(
     for (const userDoc of usersSnap.docs) {
       const uid = userDoc.id;
 
-    // CLOUD-05 FIX: Wrap per-user processing in try/catch so one bad user
-    // document (missing field, Firestore permission error, etc.) cannot
-    // abort the entire function and leave all subsequent users with no
-    // weekly report. Errors are logged per-user and processing continues.
-    try {
-      // Fetch user config
-      const configSnap = await db
-        .collection('users').doc(uid)
-        .collection('config').doc('preferences')
-        .get();
-      const config: UserConfig = configSnap.exists
-        ? (configSnap.data() as UserConfig)
-        : {
-            display_id: uid.slice(0, 8).toUpperCase(),
-            onboarding_complete: false,
-            permissions_granted: [],
-            cognitive_debt_critical_threshold: 70,
-            switch_baseline: 40,
-            switch_critical_threshold: 80,
-            sleep_target_hours: 7.5,
-            wake_hour: 7,
-            created_at: new Date().toISOString(),
-            last_calibrated_at: new Date().toISOString(),
-          };
-
-      // Fetch session documents for the week
-      const sessionDocs = await Promise.all(
-        weekDates.map(date =>
-          db.collection('users').doc(uid)
-            .collection('sessions').doc(date).get()
-        )
-      );
-
-      const validSessions: SessionDocument[] = sessionDocs
-        .filter(d => d.exists)
-        .map(d => d.data() as SessionDocument);
-
-      if (validSessions.length === 0) continue;
-
-      // ──────────────────────────────────────────────────────────────────────────
-      // Backfill /derived/{date} for any day that is missing it
-      // ──────────────────────────────────────────────────────────────────────────
-      for (let i = 0; i < validSessions.length; i++) {
-        const daySession = validSessions[i]!;
-        const derivedSnap = await db
+      // CLOUD-05 FIX: Wrap per-user processing in try/catch so one bad user
+      // document (missing field, Firestore permission error, etc.) cannot
+      // abort the entire function and leave all subsequent users with no
+      // weekly report. Errors are logged per-user and processing continues.
+      try {
+        // Fetch user config
+        const configSnap = await db
           .collection('users').doc(uid)
-          .collection('derived').doc(daySession.date)
+          .collection('config').doc('preferences')
           .get();
+        const config: UserConfig = configSnap.exists
+          ? (configSnap.data() as UserConfig)
+          : {
+              display_id: uid.slice(0, 8).toUpperCase(),
+              onboarding_complete: false,
+              permissions_granted: [],
+              cognitive_debt_critical_threshold: 70,
+              switch_baseline: 40,
+              switch_critical_threshold: 80,
+              sleep_target_hours: 7.5,
+              wake_hour: 7,
+              created_at: new Date().toISOString(),
+              last_calibrated_at: new Date().toISOString(),
+            };
 
-        if (!derivedSnap.exists) {
-          // Treat sessions before this day as "last 7" context
-          const ctx = validSessions.slice(i + 1, i + 8);
-          const derived = computeDerivedDayMetrics(daySession, ctx, config);
-          await db.collection('users').doc(uid)
+        // Fetch session documents for the week
+        const sessionDocs = await Promise.all(
+          weekDates.map(date =>
+            db.collection('users').doc(uid)
+              .collection('sessions').doc(date).get()
+          )
+        );
+
+        const validSessions: SessionDocument[] = sessionDocs
+          .filter(d => d.exists)
+          .map(d => d.data() as SessionDocument);
+
+        if (validSessions.length === 0) continue;
+
+        // ──────────────────────────────────────────────────────────────────────────
+        // Backfill /derived/{date} for any day that is missing it
+        // ──────────────────────────────────────────────────────────────────────────
+        for (let i = 0; i < validSessions.length; i++) {
+          const daySession = validSessions[i]!;
+          const derivedSnap = await db
+            .collection('users').doc(uid)
             .collection('derived').doc(daySession.date)
-            .set(derived, { merge: true });
-          console.log(`✅ Backfilled derived/${daySession.date} for uid=${uid}`);
+            .get();
+
+          if (!derivedSnap.exists) {
+            // Treat sessions before this day as "last 7" context
+            const ctx = validSessions.slice(i + 1, i + 8);
+            const derived = computeDerivedDayMetrics(daySession, ctx, config);
+            await db.collection('users').doc(uid)
+              .collection('derived').doc(daySession.date)
+              .set(derived, { merge: true });
+            console.log(`✅ Backfilled derived/${daySession.date} for uid=${uid}`);
+          }
         }
-      }
 
-      // ──────────────────────────────────────────────────────────────────────────
-      // Build enriched WeeklyReport
-      // ──────────────────────────────────────────────────────────────────────────
-      const avg = (arr: number[]): number =>
-        arr.length === 0 ? 0 : Math.round(arr.reduce((a, b) => a + b, 0) / arr.length);
+        // ENG-11: Invalidate cache after backfilling derived docs
+        await invalidateDerivedCache(uid);
 
-      const combinedLoads = validSessions.map(
-        s => s.combinedLoad ?? s.phoneMetrics?.cognitiveLoadPct ?? 0
-      );
-      const frags = validSessions.map(s => s.dualFragmentation ?? 0);
-      const debts = validSessions.map(s => s.phoneMetrics?.cognitiveDebt ?? 0);
-      const residues = validSessions.map(
-        s => Math.round((s.phoneMetrics?.residueAtEOD ?? 0) * 100)
-      );
-      const focusMinutes = validSessions.map(s => {
-        const pp = s.phoneMetrics;
-        // categoryBreakdown.productive is a 0-100 percentage, NOT a 0-1 fraction.
-        // Divide by 100 before multiplying by totalScreenTime*60 to get minutes.
-        // Without the /100, a typical day (30% productive, 6h screen) gives
-        // 6 * 60 * 30 = 10,800 minutes which is physically impossible.
-        return pp
-          ? Math.round(pp.totalScreenTime * 60 * ((pp.categoryBreakdown.productive ?? 0) / 100))
-          : 0;
-      });
-      const recoveryMinutes = validSessions.map(s => {
-        // Use verified break minutes (same logic as derivations.ts)
-        const phoneB = s.phoneMetrics?.break_events ?? [];
-        const desktopB = Object.values(s.desktopSessions ?? {}).flatMap(d => d.break_events ?? []);
-        const verified = [...phoneB, ...desktopB]
-          .filter(b => b.efficiency_pct >= 40)
-          .reduce((sum, b) => sum + b.duration_minutes, 0);
-        if (verified > 0) return verified;
-        const st = s.phoneMetrics?.totalScreenTime ?? 0;
-        return Math.max(0, 16 - st) * 60;
-      });
+        // ──────────────────────────────────────────────────────────────────────────
+        // Build enriched WeeklyReport
+        // ──────────────────────────────────────────────────────────────────────────
+        const avg = (arr: number[]): number =>
+          arr.length === 0 ? 0 : Math.round(arr.reduce((a, b) => a + b, 0) / arr.length);
 
-      // Peak debt day
-      let peakDebtIdx = 0;
-      combinedLoads.forEach((v, i) => { if (v > (combinedLoads[peakDebtIdx] ?? 0)) peakDebtIdx = i; });
-
-      // Total breaches across the week — mirrors derivations.ts combined velocity formula.
-      // Phone-only was BUG H-1: for desktop-primary users this always returned 0.
-      const totalBreaches = validSessions.reduce((sum, s) => {
-        const critThreshold = config.switch_critical_threshold ?? 80;
-        const p = s.phoneMetrics;
-
-        // Build a 24-element desktop hourly array: max across all desktop sessions per hour.
-        const desktopHourly: number[] = Object.values(s.desktopSessions ?? {}).reduce(
-          (acc: number[], d) =>
-            Array.from({ length: 24 }, (_, i) => Math.max(acc[i] ?? 0, d.hourlyLoad[i] ?? 0)),
-          Array<number>(24).fill(0)
+        const combinedLoads = validSessions.map(
+          s => s.combinedLoad ?? s.phoneMetrics?.cognitiveLoadPct ?? 0
         );
-
-        if (!p && desktopHourly.every(v => v === 0)) return sum;
-
-        // Convert hourly load percentages to velocity units (same weights as derivations.ts):
-        // phone contributes 120% of threshold-equivalent, desktop 80%.
-        const phoneVel   = (p?.hourlyLoad ?? Array<number>(24).fill(0)).map(l =>
-          Math.round((l / 100) * critThreshold * 1.2));
-        const desktopVel = desktopHourly.map(l =>
-          Math.round((l / 100) * critThreshold * 0.8));
-        const combined   = phoneVel.map((v, i) =>
-          Math.min(100, v + (desktopVel[i] ?? 0)));
-
-        return sum + combined.filter(v => v > critThreshold).length;
-      }, 0);
-
-      const report: WeeklyReport = {
-        week_id: weekId,
-        avg_combined_load: avg(combinedLoads),
-        avg_fragmentation: avg(frags),
-        avg_cognitive_debt: avg(debts),
-        avg_attention_residue: avg(residues),
-        avg_focus_minutes: avg(focusMinutes),
-        avg_recovery_minutes: avg(recoveryMinutes),
-        peak_debt_day: validSessions[peakDebtIdx]?.date ?? weekDates[0]!,
-        peak_debt_value: combinedLoads[peakDebtIdx] ?? 0,
-        total_breaches: totalBreaches,
-        computed_at: new Date().toISOString(),
-      };
-
-      await db.collection('users').doc(uid)
-        .collection('weeklyReports').doc(weekId)
-        .set(report, { merge: true });
-
-      console.log(
-        `✅ Weekly rollup for uid=${uid} week=${weekId}: ` +
-        `avgLoad=${report.avg_combined_load}%, ` +
-        `avgFrag=${report.avg_fragmentation}, ` +
-        `peakDay=${report.peak_debt_day}`
-      );
-
-      // ──────────────────────────────────────────────────────────────────────────────
-      // Auto-trigger calibration if 7+ sessions exist and calibration
-      // has never run (last_calibrated_at equals created_at) OR it has
-      // been > 6 days since the last calibration run.
-      // This replaces the manual-only flow and ensures every user
-      // gets personalized thresholds after their first week.
-      // ──────────────────────────────────────────────────────────────────────────────
-      const SIX_DAYS_MS = 6 * 24 * 60 * 60 * 1000;
-      const lastCal = new Date(config.last_calibrated_at).getTime();
-      const needsCalibration =
-        (config.last_calibrated_at === config.created_at ||
-          Date.now() - lastCal >= SIX_DAYS_MS) &&
-        validSessions.length >= 7;
-
-      if (needsCalibration) {
-        // Compute calibrated thresholds inline (mirrors calibrateBaselines.ts logic)
-        // so weeklyRollup is self-contained for new users.
-        const dailyAvgSwitches = validSessions.map(s => {
-          const total =
-            (s.phoneMetrics?.totalSwitches ?? 0) +
-            Object.values(s.desktopSessions ?? {}).reduce((sum, d) => sum + d.totalSwitches, 0);
-          const combinedHourly: number[] =
-            s.combinedHourlyLoad ?? s.phoneMetrics?.hourlyLoad ?? Array(24).fill(0);
-          const activeHours = combinedHourly.filter(l => l > 10).length || 8;
-          return total / activeHours;
+        const frags = validSessions.map(s => s.dualFragmentation ?? 0);
+        const debts = validSessions.map(s => s.phoneMetrics?.cognitiveDebt ?? 0);
+        const residues = validSessions.map(
+          s => Math.round((s.phoneMetrics?.residueAtEOD ?? 0) * 100)
+        );
+        const focusMinutes = validSessions.map(s => {
+          const pp = s.phoneMetrics;
+          // categoryBreakdown.productive is a 0-100 percentage, NOT a 0-1 fraction.
+          // Divide by 100 before multiplying by totalScreenTime*60 to get minutes.
+          // Without the /100, a typical day (30% productive, 6h screen) gives
+          // 6 * 60 * 30 = 10,800 minutes which is physically impossible.
+          return pp
+            ? Math.round(pp.totalScreenTime * 60 * ((pp.categoryBreakdown.productive ?? 0) / 100))
+            : 0;
+        });
+        const recoveryMinutes = validSessions.map(s => {
+          // Use verified break minutes (same logic as derivations.ts)
+          const phoneB = s.phoneMetrics?.break_events ?? [];
+          const desktopB = Object.values(s.desktopSessions ?? {}).flatMap(d => d.break_events ?? []);
+          const verified = [...phoneB, ...desktopB]
+            .filter(b => b.efficiency_pct >= 40)
+            .reduce((sum, b) => sum + b.duration_minutes, 0);
+          if (verified > 0) return verified;
+          const st = s.phoneMetrics?.totalScreenTime ?? 0;
+          return Math.max(0, 16 - st) * 60;
         });
 
-        const sortedSwitches = [...dailyAvgSwitches].sort((a, b) => a - b);
-        const trim = Math.floor(sortedSwitches.length * 0.15);
-        const trimmed = sortedSwitches.slice(trim, sortedSwitches.length - trim);
-        const newBaseline = Math.round(
-          trimmed.reduce((a, b) => a + b, 0) / (trimmed.length || 1)
-        );
+        // Peak debt day
+        let peakDebtIdx = 0;
+        combinedLoads.forEach((v, i) => { if (v > (combinedLoads[peakDebtIdx] ?? 0)) peakDebtIdx = i; });
 
-        const debtScores = validSessions
-          .map(s => s.combinedLoad ?? s.phoneMetrics?.cognitiveLoadPct ?? 0)
-          .sort((a, b) => a - b);
-        const p75idx = Math.floor(debtScores.length * 0.75);
-        const newDebtCritical = Math.round(debtScores[p75idx] ?? 70);
+        // Total breaches across the week — mirrors derivations.ts combined velocity formula.
+        // Phone-only was BUG H-1: for desktop-primary users this always returned 0.
+        const totalBreaches = validSessions.reduce((sum, s) => {
+          const critThreshold = config.switch_critical_threshold ?? 80;
+          const p = s.phoneMetrics;
 
-        const configRef = db.collection('users').doc(uid)
-          .collection('config').doc('preferences');
-        await configRef.update({
-          switch_baseline: Math.max(20, newBaseline),
-          switch_critical_threshold: Math.min(120, Math.max(40, newBaseline * 2)),
-          cognitive_debt_critical_threshold: Math.max(50, Math.min(90, newDebtCritical)),
-          last_calibrated_at: new Date().toISOString(),
-        });
+          // Build a 24-element desktop hourly array: max across all desktop sessions per hour.
+          const desktopHourly: number[] = Object.values(s.desktopSessions ?? {}).reduce(
+            (acc: number[], d) =>
+              Array.from({ length: 24 }, (_, i) => Math.max(acc[i] ?? 0, d.hourlyLoad[i] ?? 0)),
+            Array<number>(24).fill(0)
+          );
+
+          if (!p && desktopHourly.every(v => v === 0)) return sum;
+
+          // Convert hourly load percentages to velocity units (same weights as derivations.ts):
+          // phone contributes 120% of threshold-equivalent, desktop 80%.
+          const phoneVel   = (p?.hourlyLoad ?? Array<number>(24).fill(0)).map(l =>
+            Math.round((l / 100) * critThreshold * 1.2));
+          const desktopVel = desktopHourly.map(l =>
+            Math.round((l / 100) * critThreshold * 0.8));
+          const combined   = phoneVel.map((v, i) =>
+            Math.min(100, v + (desktopVel[i] ?? 0)));
+
+          return sum + combined.filter(v => v > critThreshold).length;
+        }, 0);
+
+        const report: WeeklyReport = {
+          week_id: weekId,
+          avg_combined_load: avg(combinedLoads),
+          avg_fragmentation: avg(frags),
+          avg_cognitive_debt: avg(debts),
+          avg_attention_residue: avg(residues),
+          avg_focus_minutes: avg(focusMinutes),
+          avg_recovery_minutes: avg(recoveryMinutes),
+          peak_debt_day: validSessions[peakDebtIdx]?.date ?? weekDates[0]!,
+          peak_debt_value: combinedLoads[peakDebtIdx] ?? 0,
+          total_breaches: totalBreaches,
+          computed_at: new Date().toISOString(),
+        };
+
+        await db.collection('users').doc(uid)
+          .collection('weeklyReports').doc(weekId)
+          .set(report, { merge: true });
+
         console.log(
-          `✅ Auto-calibrated uid=${uid}: ` +
-          `switchBaseline=${Math.max(20, newBaseline)}, ` +
-          `critThreshold=${Math.min(120, Math.max(40, newBaseline * 2))}, ` +
-          `debtCritical=${Math.max(50, Math.min(90, newDebtCritical))}`
+          `✅ Weekly rollup for uid=${uid} week=${weekId}: ` +
+          `avgLoad=${report.avg_combined_load}%, ` +
+          `avgFrag=${report.avg_fragmentation}, ` +
+          `peakDay=${report.peak_debt_day}`
         );
+
+        // ──────────────────────────────────────────────────────────────────────────────
+        // Auto-trigger calibration if 7+ sessions exist and calibration
+        // has never run (last_calibrated_at equals created_at) OR it has
+        // been > 6 days since the last calibration run.
+        // This replaces the manual-only flow and ensures every user
+        // gets personalized thresholds after their first week.
+        // ──────────────────────────────────────────────────────────────────────────────
+        const SIX_DAYS_MS = 6 * 24 * 60 * 60 * 1000;
+        const lastCal = new Date(config.last_calibrated_at).getTime();
+        const needsCalibration =
+          (config.last_calibrated_at === config.created_at ||
+            Date.now() - lastCal >= SIX_DAYS_MS) &&
+          validSessions.length >= 7;
+
+        if (needsCalibration) {
+          // Compute calibrated thresholds inline (mirrors calibrateBaselines.ts logic)
+          // so weeklyRollup is self-contained for new users.
+          const dailyAvgSwitches = validSessions.map(s => {
+            const total =
+              (s.phoneMetrics?.totalSwitches ?? 0) +
+              Object.values(s.desktopSessions ?? {}).reduce((sum, d) => sum + d.totalSwitches, 0);
+            const combinedHourly: number[] =
+              s.combinedHourlyLoad ?? s.phoneMetrics?.hourlyLoad ?? Array(24).fill(0);
+            const activeHours = combinedHourly.filter(l => l > 10).length || 8;
+            return total / activeHours;
+          });
+
+          const sortedSwitches = [...dailyAvgSwitches].sort((a, b) => a - b);
+          const trim = Math.floor(sortedSwitches.length * 0.15);
+          const trimmed = sortedSwitches.slice(trim, sortedSwitches.length - trim);
+          const newBaseline = Math.round(
+            trimmed.reduce((a, b) => a + b, 0) / (trimmed.length || 1)
+          );
+
+          const debtScores = validSessions
+            .map(s => s.combinedLoad ?? s.phoneMetrics?.cognitiveLoadPct ?? 0)
+            .sort((a, b) => a - b);
+          const p75idx = Math.floor(debtScores.length * 0.75);
+          const newDebtCritical = Math.round(debtScores[p75idx] ?? 70);
+
+          const configRef = db.collection('users').doc(uid)
+            .collection('config').doc('preferences');
+          await configRef.update({
+            switch_baseline: Math.max(20, newBaseline),
+            switch_critical_threshold: Math.min(120, Math.max(40, newBaseline * 2)),
+            cognitive_debt_critical_threshold: Math.max(50, Math.min(90, newDebtCritical)),
+            last_calibrated_at: new Date().toISOString(),
+          });
+          console.log(
+            `✅ Auto-calibrated uid=${uid}: ` +
+            `switchBaseline=${Math.max(20, newBaseline)}, ` +
+            `critThreshold=${Math.min(120, Math.max(40, newBaseline * 2))}, ` +
+            `debtCritical=${Math.max(50, Math.min(90, newDebtCritical))}`
+          );
+        }
+      } catch (userErr) {
+        // CLOUD-05 FIX: Isolate per-user errors so one failing user cannot abort
+        // the entire weekly rollup and leave all subsequent users with no report.
+        console.error(`❌ weeklyRollup failed for uid=${uid}: ${userErr}`);
       }
-    } catch (userErr) {
-      // CLOUD-05 FIX: Isolate per-user errors so one failing user cannot abort
-      // the entire weekly rollup and leave all subsequent users with no report.
-      console.error(`❌ weeklyRollup failed for uid=${uid}: ${userErr}`);
     }
-  }
   }
 );

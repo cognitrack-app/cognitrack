@@ -1,5 +1,5 @@
-import { calculateCognitiveDebt, SYNC_PAYLOAD_SCHEMA_VERSION, FIVE_MIN_MS } from '@cognitrack/shared';
-import type { AppEvent, DesktopSyncPayload, DesktopCategoryBreakdown } from '@cognitrack/shared';
+import { calculateCognitiveDebt, calculateCategoryPercentages, SYNC_PAYLOAD_SCHEMA_VERSION, FIVE_MIN_MS } from '@cognitrack/shared';
+import type { AppEvent, DesktopSyncPayload, CategoryBreakdown, DesktopCategoryBreakdown } from '@cognitrack/shared';
 import type { BrowserWindow } from 'electron';
 import type { SQLiteStore } from './sqliteStore';
 import type { SyncEngine } from '@cognitrack/sync-engine';
@@ -57,23 +57,23 @@ export async function processBatch(
     }
   }
 
-  const totalDuration = Object.values(durationByCategory).reduce((a, b) => a + b, 0) || 1;
+const totalDuration = Object.values(durationByCategory).reduce((a, b) => a + b, 0) || 1;
 
-  // ROUNDING FIX: Use Math.floor for the first four categories, then let
-  // passiveWaste absorb the remainder so the sum is always exactly 100.
-  // Math.round() on all five can produce sums of 99 or 101 due to floating
-  // point representation — this caused Firestore validation errors downstream.
-  const _productive    = Math.floor(((durationByCategory['productive']    ?? 0) / totalDuration) * 100);
-  const _tools         = Math.floor(((durationByCategory['tools']         ?? 0) / totalDuration) * 100);
-  const _social        = Math.floor(((durationByCategory['social']        ?? 0) / totalDuration) * 100);
-  const _entertainment = Math.floor(((durationByCategory['entertainment'] ?? 0) / totalDuration) * 100);
-  const categoryBreakdown: DesktopCategoryBreakdown = {
-    productive:    _productive,
-    tools:         _tools,
-    social:        _social,
-    entertainment: _entertainment,
-    passiveWaste:  100 - _productive - _tools - _social - _entertainment,
-  };
+// Use shared calculateCategoryPercentages for cross-platform parity (ENG-15).
+// This ensures identical results on phone, desktop, and Cloud Functions.
+const categoryBreakdown: CategoryBreakdown = calculateCategoryPercentages(durationByCategory, totalDuration);
+
+// Ensure we have a DesktopCategoryBreakdown shape for the payload.
+// calculateCategoryPercentages returns CategoryBreakdown (5 categories:
+// productive, tools, social, entertainment, passiveWaste), which matches
+// DesktopCategoryBreakdown (also tools + the other 4).
+const desktopCategoryBreakdown: DesktopCategoryBreakdown = {
+  productive: categoryBreakdown.productive,
+  tools: categoryBreakdown.tools,
+  social: categoryBreakdown.social,
+  entertainment: categoryBreakdown.entertainment,
+  passiveWaste: categoryBreakdown.passiveWaste,
+};
 
   const switchEvents     = rawEvents.filter(e => e.eventType === 'switch');
   const totalSwitches    = switchEvents.length;
@@ -142,7 +142,6 @@ export async function processBatch(
   // ── Build Firestore payload (11 scalars, zero raw data) ───────────────────
   const payload: DesktopSyncPayload = {
     deviceId,
-    agentType:           'desktop',
     platform:            process.platform as 'win32' | 'darwin',
     cognitiveDebt:       report.cognitiveDebt,
     cognitiveLoadPct:    report.cognitiveLoadPct,
@@ -151,12 +150,18 @@ export async function processBatch(
     totalSwitches,
     totalFocusedTime,
     switchVelocityPeak,
-    categoryBreakdown,
+    // categoryBreakdown removed - using desktopCategoryBreakdown below
     peakLoadHour:        report.peakLoadHour,
     hourlyLoad:          report.hourlyDebt,
     break_events,
     lastUpdated:         new Date().toISOString(),
     schemaVersion:       SYNC_PAYLOAD_SCHEMA_VERSION,
+    // Required by AgentPayload base type
+    date: date,
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    hourlySwitches: Array(24).fill(0), // Will be populated from switch events
+    totalTimeMs: totalSwitches * 300000, // Rough estimate: 5 min per switch
+    categoryBreakdown: desktopCategoryBreakdown, // Use shared calculated breakdown (ENG-15)
   };
 
   // ── Push into offline sync queue (fires Firestore write when online) ──────
