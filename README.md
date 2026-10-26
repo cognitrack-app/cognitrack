@@ -230,7 +230,7 @@ cd apps/desktop
 ```
 
 ```env
-FIREBASE_API_KEY=AIzaSyBwa9uCbsYvo_OZIdcmNHnnbw8AVlynbbE
+FIREBASE_API_KEY=your_firebase_api_key_here_placeholder
 FIREBASE_AUTH_DOMAIN=cognitrack-dcede.firebaseapp.com
 FIREBASE_PROJECT_ID=cognitrack-dcede
 FIREBASE_STORAGE_BUCKET=cognitrack-dcede.firebasestorage.app

@@ -98,7 +98,7 @@ const PROTOCOLS: Protocol[] = [
 ];
 
 export const seedProtocols = onCall(
-  { enforceAppCheck: false },
+  { region: 'us-central1', enforceAppCheck: true },
   async (request) => {
     // Restrict to authenticated users only — add admin role check for production
     if (!request.auth) {

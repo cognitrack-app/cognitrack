@@ -15,7 +15,7 @@ import { getFirestore } from 'firebase-admin/firestore';
  * derived collection over time.
  */
 export const cleanupOldSessions = onSchedule(
-  { schedule: '0 2 * * *', timeZone: 'UTC' },
+  { schedule: '0 2 * * *', timeZone: 'UTC', region: 'us-central1' },
   async () => {
     const db = getFirestore();
 

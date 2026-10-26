@@ -28,7 +28,7 @@ import type { UserConfig } from '@cognitrack/shared';
  *   export const initUser = onCall(...) or use getAuth().beforeCreate(...)
  */
 export const initUser = onDocumentCreated(
-  'users/{uid}/devices/{deviceId}',
+  { document: 'users/{uid}/devices/{deviceId}', region: 'us-central1' },
   async (event) => {
     const uid = event.params.uid;
     const db  = getFirestore();

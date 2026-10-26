@@ -16,6 +16,69 @@ export interface AppEvent {
   durationMs: number;
   eventType: 'switch' | 'pickup' | 'break' | 'idle';
   deviceType: DeviceType;
+  timezone?: string;       // IANA timezone (e.g., "America/Los_Angeles") - ENG-09
+}
+
+// ─── Unified Session Payload (ENG-14) ─────────────────────────────────────────
+// Single source of truth for session document fields across phone and desktop.
+// All platforms write this schema to /users/{uid}/sessions/{date}/devices/{deviceId}
+
+// Fields sent by agents (minimal set)
+export interface AgentPayload {
+  deviceId: string;
+  date: string;                   // YYYY-MM-DD (local date)
+  timezone: string;               // IANA TZ (e.g., "America/Los_Angeles")
+  hourlyLoad: number[];           // 24 elements, local hour buckets (0-100)
+  hourlySwitches: number[];       // 24 elements, switches per hour
+  totalTimeMs: number;
+  totalSwitches: number;
+  categoryBreakdown: CategoryBreakdown;
+  
+  // Core metrics from cognitive engine
+  cognitiveDebt: number;
+  cognitiveLoadPct: number;
+  wmCapacityRemaining: number;
+  residueAtEOD: number;
+  lastUpdated: string;            // ISO timestamp from device
+  schemaVersion: number;          // Payload schema version for migration
+}
+
+// Fields added by server when storing (optional for backward compat with old docs)
+export interface ServerFields {
+  userId?: string;
+  updatedAt?: string;              // Server timestamp (ISO string)
+}
+
+// Complete document stored in Firestore (agent payload + server fields)
+export interface StoredSessionPayload extends AgentPayload, ServerFields {}
+
+// Platform-specific extensions
+export interface PhoneSyncPayload extends AgentPayload {
+  platform: 'android' | 'ios';
+  totalPickups: number;
+  totalScreenTime: number;        // hours
+  switchVelocityPeak: number;     // switches/min in busiest 5-min window
+  peakLoadHour: number;
+  break_events: BreakEvent[];
+}
+
+export interface DesktopSyncPayload extends AgentPayload {
+  platform: 'darwin' | 'win32';
+  totalFocusedTime: number;       // hours
+  switchVelocityPeak: number;
+  peakLoadHour: number;
+  break_events: BreakEvent[];
+}
+
+// For Firestore documents that may have server fields added (server fields optional for backward compat)
+export interface StoredPhoneSyncPayload extends PhoneSyncPayload, ServerFields {}
+export interface StoredDesktopSyncPayload extends DesktopSyncPayload, ServerFields {}
+
+export interface Config {
+  loadSplitRatio: {
+    phone: number;    // default 0.55
+    desktop: number;  // default 0.45
+  };
 }
 
 export interface CognitiveState {
@@ -37,8 +100,9 @@ export interface CognitiveReport {
 
 export interface CategoryBreakdown {
   productive: number;
-  entertainment: number;
+  tools: number;
   social: number;
+  entertainment: number;
   passiveWaste: number;
 }
 
@@ -75,53 +139,17 @@ export interface SwitchBreach {
   is_breach: boolean;
 }
 
-// ─── Phone Sync Payload ───────────────────────────────────────────────────────
-export interface PhoneSyncPayload {
-  date: string;                   // YYYY-MM-DD
-  deviceId: string;               // SHA-256 hash
-  agentType: 'phone';
-  platform: 'android' | 'ios';
-  cognitiveDebt: number;
-  cognitiveLoadPct: number;
-  wmCapacityRemaining: number;
-  residueAtEOD: number;
-  totalScreenTime: number;        // hours
-  totalSwitches: number;
-  totalPickups: number;
-  switchVelocityPeak: number;     // switches/min in the busiest 5-min window
-  categoryBreakdown: CategoryBreakdown;
-  peakLoadHour: number;
-  hourlyLoad: number[];           // 24-element, 0-100
-  break_events: BreakEvent[];     // per-break quality records
-  lastUpdated: string;            // ISO timestamp
-  schemaVersion: number;          // payload schema version for migration
-}
-
-// ─── Desktop Sync Payload ─────────────────────────────────────────────────────
-export interface DesktopSyncPayload {
-  deviceId: string;
-  agentType: 'desktop';
-  platform: 'darwin' | 'win32';
-  cognitiveDebt: number;
-  cognitiveLoadPct: number;
-  wmCapacityRemaining: number;
-  residueAtEOD: number;
-  totalSwitches: number;
-  totalFocusedTime: number;       // hours
-  switchVelocityPeak: number;
-  categoryBreakdown: DesktopCategoryBreakdown;
-  peakLoadHour: number;
-  hourlyLoad: number[];           // 24-element, 0-100
-  break_events: BreakEvent[];     // per-break quality records
-  lastUpdated: string;
-  schemaVersion: number;          // payload schema version for migration
-}
-
 // ─── Session Document (Firestore: /users/{uid}/sessions/{date}) ───────────────
+// Uses Stored types which include server-added fields (userId, updatedAt)
 export interface SessionDocument {
   date: string;
-  phoneMetrics?: PhoneSyncPayload;
-  desktopSessions?: Record<string, DesktopSyncPayload>;
+  phoneMetrics?: StoredPhoneSyncPayload;
+  desktopSessions?: Record<string, StoredDesktopSyncPayload>;
+  // ENG-06: Separate switch counts (not summed)
+  phoneTotalSwitches?: number;
+  desktopTotalSwitches?: number;
+  // ENG-07: Configurable load split ratio used for this merge
+  loadSplitRatio?: { phone: number; desktop: number };
   // Set by mergeAgentData Cloud Function:
   combinedLoad?: number;
   dualFragmentation?: number;

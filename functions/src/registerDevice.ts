@@ -9,7 +9,7 @@ interface RegisterDevicePayload {
 }
 
 export const registerDevice = onCall(
-  { enforceAppCheck: false },
+  { region: 'us-central1', enforceAppCheck: true },
   async (request) => {
     if (!request.auth) throw new HttpsError('unauthenticated', 'Login required');
     const uid = request.auth.uid;

@@ -19,7 +19,7 @@ import { getFirestore } from 'firebase-admin/firestore';
 import type { SessionDocument, UserConfig } from '@cognitrack/shared';
 
 export const calibrateBaselines = onSchedule(
-  { schedule: '30 3 * * *', timeZone: 'Europe/Copenhagen' },
+  { schedule: '30 3 * * *', timeZone: 'Europe/Copenhagen', region: 'us-central1' },
   async () => {
     const db = getFirestore();
     const usersSnap = await db.collection('users').get();

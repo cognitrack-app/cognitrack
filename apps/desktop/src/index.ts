@@ -2,7 +2,7 @@
 import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
-import { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, shell } from 'electron';
+import { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, shell, net } from 'electron';
 import { registerIpcHandlers } from './electron/main/ipcHandlers';
 import { SQLiteStore } from './electron/main/sqliteStore';
 import { ActiveWindowTracker } from './electron/main/activeWindowTracker';
@@ -19,6 +19,8 @@ import {
   ADAPTIVE_SYNC_VELOCITY_DELTA_THRESHOLD,
   ADAPTIVE_SYNC_JITTER_MS,
 } from '@cognitrack/shared';
+import { DebouncedSync, getOnlineStatus, onOnlineChange } from '@cognitrack/shared';
+import { HeartbeatSync } from '@cognitrack/sync-engine';
 
 // ── Module-level singletons (set once in whenReady) ─────────────────────────────
 
@@ -70,7 +72,11 @@ app.whenReady().then(async () => {
   const dbDir = path.join(app.getPath('userData'), 'db');
   fs.mkdirSync(dbDir, { recursive: true });
   const queueDbPath = path.join(dbDir, 'sync-queue.db');
-  syncEngine = new SyncEngine(queueDbPath);
+  syncEngine = new SyncEngine(queueDbPath as any);
+  let lastProcessedDate = getTodayDateString();
+
+
+
 
   // 4. Active window tracker (no start yet — needs auth + permission first)
   tracker = new ActiveWindowTracker(store);
@@ -159,7 +165,48 @@ app.whenReady().then(async () => {
   // 14. Hourly batch: compute cognitive metrics and sync to Firestore
   scheduleAdaptiveBatch();
 
-  // 15. If launched with --hidden (OS startup item), ensure popover stays closed
+  // 15. Event-triggered debounced sync (ENG-01): flush on every event write,
+  //     debounced to batch rapid events, forced flush after maxWait.
+  const debouncedSync = new DebouncedSync({
+    debounceMs: 10_000,     // 10s debounce
+    maxWaitMs: 30_000,      // 30s max wait
+    flushFn: async () => {  // flush only if online
+      if (getOnlineStatus()) {
+        await processBatch(store, syncEngine, userId, deviceId, mainWindow, tracker, lastProcessedDate);
+      }
+    },
+  });
+
+  // Register online/offline listeners to trigger sync engine flush
+  const cleanupOnlineListener = onOnlineChange((online) => {
+    if (online) {
+      debouncedSync.trigger();
+    }
+  });
+
+  // Listen for network online/offline events
+  (net as any).on('online', () => {
+    debouncedSync.trigger();
+  });
+  (net as any).on('offline', () => {
+    // optionally handle offline state
+  });
+
+  // 15b. Heartbeat sync for idle devices (ENG-16): sends lastSeen update every 6 hours
+  const heartbeat = HeartbeatSync.create({
+    deviceId,
+    platform: process.platform as 'win32' | 'darwin',
+    appVersion: app.getVersion(),
+    updateDeviceLastSeen: async () => {
+      await registerDevice(
+        userId, deviceId, process.platform as 'win32' | 'darwin', 'CogniTrack Desktop', app.getVersion(),
+      );
+      return { success: true };
+    },
+  });
+  heartbeat.start();
+
+  // 16. If launched with --hidden (OS startup item), ensure popover stays closed
   if (process.argv.includes('--hidden')) {
     mainWindow?.hide();
   }

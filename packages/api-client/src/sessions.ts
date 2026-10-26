@@ -53,7 +53,7 @@ export async function writeDesktopSession(
       date,
       deletedAt: null,
       updatedAt: serverTimestamp(),
-      [`desktopSessions.${deviceId}`]: payload,
+      desktopSessions: { [deviceId]: payload },
     },
     { merge: true },
   );

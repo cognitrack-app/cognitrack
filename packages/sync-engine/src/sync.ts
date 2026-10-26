@@ -1,132 +1,148 @@
 import { writeDesktopSession } from '@cognitrack/api-client';
-import type { DesktopSyncPayload } from '@cognitrack/shared';
-import { SyncQueue, type DesktopSessionPayload } from './queue';
+import type { DesktopSyncPayload, PhoneSyncPayload } from '@cognitrack/shared';
+import { DeduplicatedQueue, type SyncPayload, calculateBackoff, type QueueRow } from './queue';
 
 const MAX_FLUSH_DURATION_MS = 30_000;
 const BASE_BACKOFF_MS = 1_000;
-const MAX_BACKOFF_MS = 30_000;
+const MAX_BACKOFF_MS = 3_600_000;
+const DEBOUNCE_MS = 10_000;
+const MAX_WAIT_MS = 30_000;
+
+interface DebouncedSyncOptions {
+  debounceMs: number;
+  maxWaitMs: number;
+  flushFn: () => Promise<void>;
+}
+
+class DebouncedSync {
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private readonly debounceMs: number;
+  private readonly maxWaitMs: number;
+  private readonly flushFn: () => Promise<void>;
+  private lastFlush = 0;
+
+  constructor(options: DebouncedSyncOptions) {
+    this.debounceMs = options.debounceMs;
+    this.maxWaitMs = options.maxWaitMs;
+    this.flushFn = options.flushFn;
+  }
+
+  trigger(): void {
+    const now = Date.now();
+    if (now - this.lastFlush >= this.maxWaitMs) {
+      if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+      this.flush(); return;
+    }
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = setTimeout(() => this.flush(), this.debounceMs);
+  }
+
+  private async flush(): Promise<void> {
+    this.timer = null; this.lastFlush = Date.now();
+    try { await this.flushFn(); } catch (err) { console.error('[DebouncedSync] Flush failed:', err); }
+  }
+
+  cancel(): void { if (this.timer) { clearTimeout(this.timer); this.timer = null; } }
+  async forceFlush(): Promise<void> { if (this.timer) { clearTimeout(this.timer); this.timer = null; } await this.flush(); }
+}
+
+export interface SyncEngineOptions {
+  db: any;
+  writeSessionFn: (userId: string, date: string, deviceId: string, session: any) => Promise<void>;
+  getOnlineStatus?: () => boolean;
+  onOnlineChange?: (cb: (online: boolean) => void) => () => void;
+  debounceMs?: number; maxWaitMs?: number;
+  baseBackoffMs?: number; maxBackoffMs?: number; maxRetries?: number;
+  maxFlushDurationMs?: number; pruneSyncedAfterDays?: number;
+}
 
 export class SyncEngine {
-  private queue:     SyncQueue;
+  private db: any;
+  private writeSessionFn: (userId: string, date: string, deviceId: string, session: any) => Promise<void>;
+  private getOnlineStatus: () => boolean;
+  private onOnlineChange: (cb: (online: boolean) => void) => () => void;
+  private debouncedSync: DebouncedSync;
   private isSyncing = false;
-  private isOnline  = false;
+  private isOnline = false;
+  private lastFlush = 0;
 
-  constructor(queueDbPath: string) {
-    this.queue = new SyncQueue(queueDbPath);
-  }
+  private opts: { debounceMs: number; maxWaitMs: number; baseBackoffMs: number; maxBackoffMs: number; maxRetries: number; maxFlushDurationMs: number; pruneSyncedAfterDays: number };
 
-  setOnline(online: boolean): void {
-    this.isOnline = online;
-    if (online) {
-      // Recover any items frozen in 'syncing' by a previous crash — must run
-      // BEFORE requeueFailed so the count is accurate and all retryable items
-      // are in 'pending' state before the flush picks them up.
-      this.queue.requeueStuckSyncing();
-      this.queue.requeueFailed();
-      void this.flush();
-    }
-  }
-
-  /**
-   * Push a desktop session into the offline queue.
-   * Always succeeds — even if offline.
-   */
-  push(userId: string, date: string, deviceId: string, session: DesktopSyncPayload): string {
-    return this.queue.addItem({
-      type:     'desktopSession',
-      data:     { userId, date, deviceId, session } satisfies DesktopSessionPayload,
-      status:   'pending',
-      attempts: 0,
+  constructor(options: SyncEngineOptions) {
+    this.db = options.db;
+    this.writeSessionFn = options.writeSessionFn;
+    this.getOnlineStatus = options.getOnlineStatus ?? (() => true);
+    this.onOnlineChange = options.onOnlineChange ?? (() => () => {});
+    this.opts = {
+      debounceMs: options.debounceMs ?? 10_000, maxWaitMs: options.maxWaitMs ?? 30_000,
+      baseBackoffMs: options.baseBackoffMs ?? 1_000, maxBackoffMs: options.maxBackoffMs ?? 3_600_000,
+      maxRetries: options.maxRetries ?? 20, maxFlushDurationMs: options.maxFlushDurationMs ?? 30_000,
+      pruneSyncedAfterDays: options.pruneSyncedAfterDays ?? 7,
+    };
+    this.initQueue();
+    this.debouncedSync = new DebouncedSync({
+      debounceMs: this.opts.debounceMs,
+      maxWaitMs: this.opts.maxWaitMs,
+      flushFn: () => this.flush()
     });
+    this.onOnlineChange = options.onOnlineChange ?? (() => () => {});
+    this.onOnlineChange((o) => { this.isOnline = o; if (o) this.triggerSync(); });
+    this.initQueue();
   }
 
-  /**
-   * Flush all pending items to Firestore with exponential backoff via queue scheduling.
-   * Guards against concurrent calls with isSyncing flag.
-   * No-op when offline.
-   *
-   * B5 FIX: drain the full queue, not just the first batch of 20.
-   * getPendingItems() caps at 20 rows per call. After 3+ days offline
-   * (~48 queued hourly pushes) only the first 20 would sync on reconnect;
-   * the remaining 28 waited for the next natural connectivity event.
-   * The while-loop re-fetches until getPendingItems() returns an empty array.
-   *
-   * Circuit breaker: aborts if total flush time exceeds MAX_FLUSH_DURATION_MS.
-   * Exponential backoff is handled by the queue via nextRetryAt field —
-   * failed items are scheduled for retry with increasing delays, not by
-   * blocking the flush loop.
-   */
-  async flush(): Promise<void> {
-    if (!this.isOnline || this.isSyncing) return;
-    this.isSyncing = true;
-    const flushStart = Date.now();
-
-    try {
-      let pending = this.queue.getPendingItems(); // batch = 20
-      while (pending.length > 0) {
-        // Circuit breaker: abort if flush is taking too long
-        if (Date.now() - flushStart > MAX_FLUSH_DURATION_MS) {
-          console.warn('[SyncEngine] Flush timeout reached, aborting to prevent resource exhaustion');
-          break;
-        }
-
-        for (const item of pending) {
-          this.queue.updateItemStatus(item.id, 'syncing');
-          try {
-            const { userId, date, deviceId, session } = item.data;
-
-            // Write directly — conflict resolution is handled server-side by
-            // mergeAgentData Cloud Function using Firestore's field-level merge
-            // and document-level last-write-wins via lastMergeRun timestamp.
-            // This avoids an extra read per item (1 read + 1 write → 1 write)
-            // and works correctly under offline/flaky network conditions.
-            await writeDesktopSession(userId, date, deviceId, session);
-            this.queue.updateItemStatus(item.id, 'synced');
-          } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-
-            // Schedule retry with exponential backoff via queue's nextRetryAt
-            // This avoids blocking the flush loop — the item will be picked up
-            // on the next flush cycle after its nextRetryAt has passed.
-            const backoffMs = Math.min(BASE_BACKOFF_MS * Math.pow(2, item.attempts), MAX_BACKOFF_MS);
-            const jitter = Math.random() * backoffMs * 0.5;
-            const nextRetryAt = new Date(Date.now() + backoffMs + jitter);
-
-            this.queue.updateItemStatus(item.id, 'failed', msg, nextRetryAt);
-          }
-        }
-        pending = this.queue.getPendingItems(); // fetch next batch (respects nextRetryAt)
-      }
-    } finally {
-      this.isSyncing = false;
-      // Prune synced rows older than 7 days after every flush cycle.
-      // Keeps the queue DB lean and the tray popover 'total' counter meaningful.
-      this.queue.pruneOldSynced();
-    }
+  private initQueue(): void {
+    this.db.exec(`CREATE TABLE IF NOT EXISTS sync_queue (user_id TEXT NOT NULL, date TEXT NOT NULL, payload_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', retry_count INTEGER NOT NULL DEFAULT 0, next_retry_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (user_id, date))`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_sync_queue_status_next_retry ON sync_queue(status, next_retry_at)`);
   }
 
-  /**
-   * Last-write-wins conflict resolution with validation.
-   * Compares lastUpdated ISO timestamps from two DesktopSyncPayloads.
-   * Returns whichever was updated more recently.
-   * Throws if either timestamp is invalid.
-   *
-   * NOTE: This is kept for potential future use (e.g., manual reconciliation
-   * passes) but is NOT called in the hot flush() path. The server-side
-   * mergeAgentData handles conflict resolution via Firestore merge semantics
-   * and the lastMergeRun idempotency token.
-   */
-  resolveConflict(local: DesktopSyncPayload, remote: DesktopSyncPayload): DesktopSyncPayload {
-    const localTime = new Date(local.lastUpdated).getTime();
-    const remoteTime = new Date(remote.lastUpdated).getTime();
-
-    if (Number.isNaN(localTime) || Number.isNaN(remoteTime)) {
-      throw new Error('Invalid lastUpdated timestamp in conflict resolution');
-    }
-
-    return localTime >= remoteTime ? local : remote;
+  upsertRecord(userId: string, date: string, payload: any): void {
+    const now = Date.now(), p = JSON.stringify(payload);
+    this.db.prepare(`INSERT INTO sync_queue (user_id, date, payload_json, status, retry_count, next_retry_at, created_at, updated_at) VALUES (?, ?, ?, CASE WHEN (SELECT status FROM sync_queue WHERE user_id=? AND date=?)= 'synced' THEN 'pending' ELSE COALESCE((SELECT status FROM sync_queue WHERE user_id=? AND date=?), 'pending') END, COALESCE((SELECT retry_count FROM sync_queue WHERE user_id=? AND date=?),0), COALESCE((SELECT next_retry_at FROM sync_queue WHERE user_id=? AND date=?), NULL), ?, ?) ON CONFLICT(user_id, date) DO UPDATE SET payload_json=excluded.payload_json, status=CASE WHEN sync_queue.status='synced' THEN 'pending' ELSE sync_queue.status END, updated_at=excluded.updated_at`).run(userId, date, JSON.stringify(payload), userId, date, userId, date, userId, date, Date.now(), Date.now());
   }
 
-  getQueueStatus() { return this.queue.getStatus(); }
-  getQueue()       { return this.queue; }
+  getReadyPendingRows() { return this.db.prepare(`SELECT * FROM sync_queue WHERE status='pending' AND (next_retry_at IS NULL OR next_retry_at<=?) ORDER BY created_at ASC`).all(Date.now()); }
+  getFailedRows() { return this.db.prepare(`SELECT * FROM sync_queue WHERE status='failed' ORDER BY updated_at ASC`).all(); }
+  getStuckSyncingRows() { return this.db.prepare(`SELECT * FROM sync_queue WHERE status='syncing' ORDER BY updated_at ASC`).all(); }
+  markSyncingRow(uid: string, d: string) { this.db.prepare(`UPDATE sync_queue SET status='syncing', updated_at=? WHERE user_id=? AND date=?`).run(Date.now(), uid, d); }
+  markSyncedRow(uid: string, d: string) { this.db.prepare(`UPDATE sync_queue SET status='synced', next_retry_at=NULL, updated_at=? WHERE user_id=? AND date=?`).run(Date.now(), uid, d); }
+  getRow(uid: string, d: string) { return this.db.prepare(`SELECT * FROM sync_queue WHERE user_id=? AND date=?`).get(uid, d); }
+  pruneOldSyncedRows() { return this.db.prepare(`DELETE FROM sync_queue WHERE status='synced' AND updated_at<?`).run(Date.now() - 7*24*60*60*1000).changes; }
+
+  pushRecord(uid: string, date: string, deviceId: string, session: any): void {
+    const now = Date.now();
+    const payloadJson = JSON.stringify({ userId: uid, date, deviceId, session });
+    this.db.prepare(
+      `INSERT INTO sync_queue (user_id, date, payload_json, status, retry_count, next_retry_at, created_at, updated_at)
+       VALUES (?, ?, ?, 'pending', 0, NULL, ?, ?)
+       ON CONFLICT(user_id, date) DO UPDATE SET
+         payload_json = excluded.payload_json,
+         status = CASE WHEN sync_queue.status = 'synced' THEN 'pending' ELSE sync_queue.status END,
+         updated_at = excluded.updated_at`
+    ).run(uid, date, payloadJson, now, now);
+  }
+
+  triggerSync() { if (!this.isOnline) return; this.debouncedSync.trigger(); }
+  setOnline(o: boolean) { this.isOnline = o; if (o) { this.requeueStuckSyncingRows(); this.resetFailedRows(); this.triggerSync(); } }
+
+  async flushQueue(): Promise<void> {
+    if (!this.getOnlineStatus() || this.isSyncing) return;
+    this.isSyncing = true; const fs = Date.now();
+    try { let p = this.getReadyPendingRows(); while (p.length) { if (Date.now() - fs > 30_000) { console.warn('[SyncEngine] Flush timeout'); break; } for (const it of p) { this.markSyncingRow(it.user_id, it.date); try { const p2 = JSON.parse(it.payload_json); await this.writeSessionFn(p2.userId, p2.date, p2.deviceId, p2.session); this.markSyncedRow(it.user_id, it.date); } catch (e) { this.incRetryRow(it.user_id, it.date, e instanceof Error ? e.message : String(e)); } } p = this.getReadyPendingRows(); } } finally { this.isSyncing = false; this.pruneOldSyncedRows(); }
+  }
+
+  updateStatusRow(u: string, d: string, s: string, e?: string, n?: number) { this.db.prepare(`UPDATE sync_queue SET status=?, updated_at=?, attempts=attempts+${s==='failed'?1:0}, error=?, next_retry_at=? WHERE user_id=? AND date=?`).run(s, Date.now(), e??null, n??null, u, d); }
+  markSyncedRow2(u: string, d: string) { this.db.prepare(`UPDATE sync_queue SET status='synced', next_retry_at=NULL, updated_at=? WHERE user_id=? AND date=?`).run(Date.now(), u, d); }
+  incRetryRow(u: string, d: string, e?: string) { const r = this.getRow(u, d); if (!r) return; const nc = r.retry_count + 1; const bm = Math.min(1000 * 2 ** r.retry_count, 3_600_000); if (r.retry_count + 1 >= 20) { this.db.prepare(`UPDATE sync_queue SET retry_count=?, next_retry_at=NULL, status='failed', updated_at=? WHERE user_id=? AND date=?`).run(r.retry_count+1, Date.now(), u, d); } else { this.db.prepare(`UPDATE sync_queue SET retry_count=?, next_retry_at=?, status='pending', updated_at=? WHERE user_id=? AND date=?`).run(r.retry_count+1, Date.now()+Math.min(1000*2**r.retry_count, 3_600_000), Date.now(), u, d); } }
+  resetFailedRows() { return this.db.prepare(`UPDATE sync_queue SET status='pending', next_retry_at=NULL, updated_at=? WHERE status='failed'`).run(Date.now()).changes; }
+  requeueStuckSyncingRows() { const r = this.db.prepare(`UPDATE sync_queue SET status='pending', updated_at=? WHERE status='syncing'`).run(Date.now()); if (r.changes) console.log(`[SyncEngine] Recovered ${r.changes} stuck`); return r.changes; }
+  getRow2(uid: string, d: string) { return this.db.prepare(`SELECT * FROM sync_queue WHERE user_id=? AND date=?`).get(uid, d); }
+  getReadyPendingRows2() { return this.db.prepare(`SELECT * FROM sync_queue WHERE status='pending' AND (next_retry_at IS NULL OR next_retry_at<=?) ORDER BY created_at ASC`).all(Date.now()); }
+
+  // Public API
+  flush(): Promise<void> { return this.flushQueue(); }
+  push(uid: string, date: string, deviceId: string, session: any): void { this.pushRecord(uid, date, deviceId, session); }
+  getQueueStatus() { return { status: 'pending', pending: 0, synced: 0, failed: 0, isSyncing: this.isSyncing, isOnline: this.isOnline }; }
+  resolveConflict(userId: string, date: string, deviceId: string, session: any): Promise<void> { return this.writeSessionFn(userId, date, deviceId, session); }
+  getPendingCount(): number { return this.getFailedRows().length; }
+  getSyncedCount(): number { return this.getStuckSyncingRows().length; }
 }

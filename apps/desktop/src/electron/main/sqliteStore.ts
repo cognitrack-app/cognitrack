@@ -3,6 +3,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import type { AppEvent, Category, DeviceType } from '@cognitrack/shared';
+import type { SyncEngineOptions } from '@cognitrack/sync-engine';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -110,6 +111,23 @@ export class SQLiteStore {
         categoryBreakdown   TEXT NOT NULL DEFAULT '{}',
         synced              INTEGER NOT NULL DEFAULT 0,
         updatedAt           INTEGER NOT NULL
+      );
+
+      -- ── Offline sync queue with upsert schema (ENG-12) ──────────────────────
+      -- One row per user per date, PRIMARY KEY (user_id, date).
+      -- Status flow: pending → syncing → synced, or failed after max retries.
+      -- Exponential backoff: base 1s, max 1hr, max 20 retries.
+      -- Does NOT delete on retry exhaustion — retains in 'failed' state for manual recovery.
+      CREATE TABLE IF NOT EXISTS sync_queue (
+        user_id           TEXT NOT NULL,
+        date              TEXT NOT NULL,              -- YYYY-MM-DD
+        payload_json      TEXT NOT NULL,              -- JSON DesktopSyncPayload
+        status            TEXT NOT NULL DEFAULT 'pending',
+        retry_count       INTEGER NOT NULL DEFAULT 0,
+        next_retry_at     INTEGER,                  -- Unix ms, null = no retry scheduled
+        created_at        INTEGER NOT NULL,
+        updated_at        INTEGER NOT NULL,
+        PRIMARY KEY (user_id, date)
       );
     `);
   }

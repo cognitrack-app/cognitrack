@@ -47,7 +47,7 @@ export const dailyReset = onSchedule(
   // field from UserConfig (default 1 = CEST). When present we shift the date
   // calculation so non-EU users get carryover seeded into their correct local
   // date document rather than the server's Copenhagen date.
-  { schedule: '0 7 * * *', timeZone: 'Europe/Copenhagen' },
+  { schedule: '0 7 * * *', timeZone: 'Europe/Copenhagen', region: 'us-central1' },
   async () => {
     const db = getFirestore();
 
